@@ -380,8 +380,8 @@ def _install_music_assistant() -> None:
         """Minimal MusicProvider stand-in."""
 
         instance_id: str = "test_instance"
-        domain: str = "ytmusic_free"
-        name: str = "YouTube Music (Free)"
+        domain: str = "ytmusic"
+        name: str = "YouTube Music"
 
         def __init__(self, mass=None, manifest=None, config=None, supported_features=None):
             import logging
@@ -390,7 +390,7 @@ def _install_music_assistant() -> None:
             self.manifest = manifest
             self.config = config
             self.supported_features = supported_features or set()
-            self.logger = logging.getLogger("ytmusic_free_test")
+            self.logger = logging.getLogger("ytmusic_test")
 
         async def loaded_in_mass(self):
             return None
@@ -407,21 +407,21 @@ _install_music_assistant_models()
 _install_music_assistant()
 
 
-# Ensure the repo root is on sys.path so `import ytmusic_free` works.
+# Ensure the repo root is on sys.path so `import ytmusic` works.
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
 @pytest.fixture
 def provider():
-    """Return a YoutubeMusicFreeProvider instance with stubbed dependencies.
+    """Return a YoutubeMusicProvider instance with stubbed dependencies.
 
     The provider's __init__ goes through the stubbed MusicProvider base and
     skips the real async setup. Tests poke at parser/helper methods directly.
     """
-    from ytmusic_free import YoutubeMusicFreeProvider
+    from ytmusic import YoutubeMusicProvider
 
-    instance = YoutubeMusicFreeProvider(mass=None, manifest=None, config=None)
+    instance = YoutubeMusicProvider(mass=None, manifest=None, config=None)
     instance._ytmusic = None
     instance._yt_dlp_module = None
     instance._prefer_quality = True

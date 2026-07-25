@@ -11,6 +11,7 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/install_watcher_addon.sh"
+REPO_NAME="music-assistant-yt-music"
 
 PASS=0
 FAIL=0
@@ -175,26 +176,24 @@ else
     skip "auto-detect found a real add-ons dir on this host -- failure path not exercised"
 fi
 
-# --- Section 2: end-to-end install (network) --------------------------------
+# --- Section 2: end-to-end install ------------------------------------------
 
 printf '\n== End-to-end install ==\n'
 
-network_ok=0
-if [ "${SKIP_NETWORK_TESTS:-0}" = "1" ]; then
-    skip "network tests disabled via SKIP_NETWORK_TESTS=1"
-elif ! command -v curl >/dev/null 2>&1; then
-    skip "curl not available -- skipping network tests"
-elif ! curl -fsS --max-time 10 -o /dev/null https://codeload.github.com 2>/dev/null; then
-    skip "GitHub unreachable -- skipping network tests"
+if ! command -v curl >/dev/null 2>&1; then
+    skip "curl not available -- skipping end-to-end tests"
 else
-    network_ok=1
-fi
-
-if [ "$network_ok" = "1" ]; then
     TMP_ADDONS="$(mktemp -d)"
     trap 'rm -rf "$TMP_ADDONS"' EXIT INT TERM
+    FIXTURE_ROOT="$TMP_ADDONS/$REPO_NAME-master"
+    FIXTURE_ARCHIVE="$TMP_ADDONS/provider-fixture.tar.gz"
+    mkdir -p "$FIXTURE_ROOT"
+    cp -R "$REPO_ROOT/ytmusic" "$FIXTURE_ROOT/ytmusic"
+    tar -czf "$FIXTURE_ARCHIVE" -C "$TMP_ADDONS" "$REPO_NAME-master"
+    rm -rf "$FIXTURE_ROOT"
+    FIXTURE_URL="file://$FIXTURE_ARCHIVE"
 
-    install_out="$(sh "$SCRIPT" \
+    install_out="$(YTMUSIC_TARBALL_URL_OVERRIDE="$FIXTURE_URL" sh "$SCRIPT" \
         --force \
         --addons-dir "$TMP_ADDONS" \
         --ma-id addon_TESTID_music_assistant \
@@ -210,8 +209,8 @@ if [ "$network_ok" = "1" ]; then
     assert_file_exists "build.yaml created"   "$ADDON/build.yaml"
     assert_file_exists "Dockerfile created"   "$ADDON/Dockerfile"
     assert_file_exists "run.sh created"       "$ADDON/run.sh"
-    assert_file_exists "ytmusic_free/__init__.py copied"   "$ADDON/ytmusic_free/__init__.py"
-    assert_file_exists "ytmusic_free/manifest.json copied" "$ADDON/ytmusic_free/manifest.json"
+    assert_file_exists "ytmusic/__init__.py copied"   "$ADDON/ytmusic/__init__.py"
+    assert_file_exists "ytmusic/manifest.json copied" "$ADDON/ytmusic/manifest.json"
 
     if [ -x "$ADDON/run.sh" ]; then
         pass "run.sh is executable"
@@ -250,7 +249,7 @@ if [ "$network_ok" = "1" ]; then
     fi
 
     dockerfile="$(cat "$ADDON/Dockerfile")"
-    assert_contains "Dockerfile copies provider" "COPY ytmusic_free/ /provider/ytmusic_free/" "$dockerfile"
+    assert_contains "Dockerfile copies provider" "COPY ytmusic/ /provider/ytmusic/" "$dockerfile"
     assert_contains "Dockerfile installs docker-cli" "docker-cli" "$dockerfile"
 
     # --- Idempotency ---
@@ -260,7 +259,12 @@ if [ "$network_ok" = "1" ]; then
     printf 'SENTINEL_FROM_PREVIOUS_INSTALL\n' > "$ADDON/SENTINEL"
 
     # Without --force, "n" answer should abort and leave the install untouched.
-    abort_out="$(printf 'n\n' | sh "$SCRIPT" --addons-dir "$TMP_ADDONS" --ma-id x --python-version python3.13 2>&1)"
+    abort_out="$(
+        printf 'n\n' \
+            | env YTMUSIC_TARBALL_URL_OVERRIDE="$FIXTURE_URL" \
+                sh "$SCRIPT" --addons-dir "$TMP_ADDONS" \
+                    --ma-id x --python-version python3.13 2>&1
+    )"
     abort_rc=$?
     if [ "$abort_rc" -ne 0 ]; then
         pass "re-install without --force and 'n' answer aborts"
@@ -271,7 +275,8 @@ if [ "$network_ok" = "1" ]; then
     assert_file_exists "aborted re-install leaves sentinel intact" "$ADDON/SENTINEL"
 
     # With --force, sentinel must be gone afterwards.
-    sh "$SCRIPT" --force --addons-dir "$TMP_ADDONS" \
+    YTMUSIC_TARBALL_URL_OVERRIDE="$FIXTURE_URL" \
+        sh "$SCRIPT" --force --addons-dir "$TMP_ADDONS" \
         --ma-id addon_FORCED_music_assistant --python-version python3.42 \
         >/dev/null 2>&1
     if [ ! -f "$ADDON/SENTINEL" ]; then
@@ -290,7 +295,10 @@ if [ "$network_ok" = "1" ]; then
     printf '\n== Auto-detection fallback ==\n'
 
     rm -rf "$ADDON"
-    fallback_out="$(sh "$SCRIPT" --force --addons-dir "$TMP_ADDONS" 2>&1)"
+    fallback_out="$(
+        YTMUSIC_TARBALL_URL_OVERRIDE="$FIXTURE_URL" \
+            sh "$SCRIPT" --force --addons-dir "$TMP_ADDONS" 2>&1
+    )"
     fallback_rc=$?
     assert_eq "fallback install exits 0" "0" "$fallback_rc"
 

@@ -1,6 +1,6 @@
 {
   "type": "music",
-  "domain": "ytmusic_free",
+  "domain": "ytmusic",
   "stage": "experimental",
   "name": "YouTube Music",
   "description": "Stream YouTube Music and retain completed plays in a persistent local cache.",

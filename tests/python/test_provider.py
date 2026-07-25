@@ -1,4 +1,4 @@
-"""Unit tests for the YouTube Music (Free) provider."""
+"""Unit tests for the YouTube Music provider."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from music_assistant_models.errors import (
 )
 from music_assistant_models.streamdetails import StreamDetails
 
-import ytmusic_free as ytm
+import ytmusic as ytm
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +79,7 @@ def test_auth_constants():
     ],
 )
 def test_yt_playlist_url_strips_vl_prefix(playlist_id, expected):
-    assert ytm.YoutubeMusicFreeProvider._yt_playlist_url(playlist_id) == expected
+    assert ytm.YoutubeMusicProvider._yt_playlist_url(playlist_id) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +172,7 @@ def test_build_auth_headers_satisfies_ytmusicapi_browser_contract(provider, monk
 
 def _make_provider(instance_id):
     """Build a second provider instance the way the `provider` fixture does."""
-    instance = ytm.YoutubeMusicFreeProvider(mass=None, manifest=None, config=None)
+    instance = ytm.YoutubeMusicProvider(mass=None, manifest=None, config=None)
     instance.instance_id = instance_id
     instance._ytmusic = None
     instance._authenticated = False
@@ -259,7 +259,7 @@ def test_instance_name_postfix_is_never_none_or_empty():
     fallback never reaches the name. The postfix also lands in library data,
     since playlist owners fall back to the provider name.
     """
-    instance = _make_provider("ytmusic_free--abcdef123456")
+    instance = _make_provider("ytmusic--abcdef123456")
     instance.config = _StubConfig({})
     postfix = instance.instance_name_postfix
     assert postfix
@@ -268,34 +268,34 @@ def test_instance_name_postfix_is_never_none_or_empty():
 
 
 def test_instance_name_postfix_differs_between_instances():
-    first = _make_provider("ytmusic_free--aaaaaaaa1111")
-    second = _make_provider("ytmusic_free--bbbbbbbb2222")
+    first = _make_provider("ytmusic--aaaaaaaa1111")
+    second = _make_provider("ytmusic--bbbbbbbb2222")
     first.config = _StubConfig({})
     second.config = _StubConfig({})
     assert first.instance_name_postfix != second.instance_name_postfix
 
 
 def test_instance_name_postfix_prefers_the_brand_account():
-    instance = _make_provider("ytmusic_free--abcdef123456")
+    instance = _make_provider("ytmusic--abcdef123456")
     instance.config = _StubConfig({ytm.CONF_BRAND_ACCOUNT: "112233445566"})
     assert instance.instance_name_postfix == "112233445566"
 
 
 def test_instance_name_postfix_uses_the_account_index_when_set():
-    instance = _make_provider("ytmusic_free--abcdef123456")
+    instance = _make_provider("ytmusic--abcdef123456")
     instance.config = _StubConfig({ytm.CONF_AUTH_USER: 2})
     assert instance.instance_name_postfix == "account 2"
 
 
 def test_instance_name_postfix_survives_a_missing_config():
-    instance = _make_provider("ytmusic_free--abcdef123456")
+    instance = _make_provider("ytmusic--abcdef123456")
     instance.config = None
     assert instance.instance_name_postfix
 
 
 def test_library_seen_nonempty_is_not_shared_between_instances():
     """A class-level `= {}` default here would cross-contaminate accounts."""
-    assert "_library_seen_nonempty" not in vars(ytm.YoutubeMusicFreeProvider)
+    assert "_library_seen_nonempty" not in vars(ytm.YoutubeMusicProvider)
 
     alice = _make_provider("inst_alice")
     bob = _make_provider("inst_bob")
@@ -544,7 +544,7 @@ def test_parse_track_minimal(provider):
     assert track.artists[0].name == "An Artist"
     mappings = list(track.provider_mappings)
     assert mappings[0].item_id == "abc123"
-    assert mappings[0].provider_domain == "ytmusic_free"
+    assert mappings[0].provider_domain == "ytmusic"
     assert mappings[0].url == f"{ytm.YTM_DOMAIN}/watch?v=abc123"
 
 
@@ -1130,7 +1130,7 @@ def test_prefetch_enqueues_durable_catalog_candidates(provider, tmp_path):
 def test_catalog_reconciliation_requeues_missing_files(provider, tmp_path):
     """A stale PostgreSQL cache hit must become claimable without a DB reset."""
 
-    from ytmusic_free.catalog import CachedEntry
+    from ytmusic.catalog import CachedEntry
 
     existing_id = "existing-video"
     missing_id = "missing-video"
@@ -1186,7 +1186,7 @@ def test_requested_cache_miss_receives_demand_priority(provider):
 def test_catalog_prefetch_claims_only_one_job_at_a_time(provider, tmp_path):
     """Sequential claims leave later jobs eligible for demand reprioritization."""
 
-    from ytmusic_free.catalog import CacheJob
+    from ytmusic.catalog import CacheJob
 
     class Catalog:
         claims = []
@@ -1237,7 +1237,7 @@ def test_catalog_prefetch_claims_only_one_job_at_a_time(provider, tmp_path):
 def test_catalog_prefetch_progress_never_exceeds_one_hundred(provider, tmp_path):
     """Older durable claims must not overflow progress for a short fresh list."""
 
-    from ytmusic_free.catalog import CacheJob
+    from ytmusic.catalog import CacheJob
 
     class Catalog:
         jobs = [
@@ -2583,7 +2583,7 @@ class _CaptureHandler(_logging.Handler):
 
 def _attach_capture(provider):
     handler = _CaptureHandler()
-    logger = _logging.getLogger(f"ytmusic_free_capture_{id(handler)}")
+    logger = _logging.getLogger(f"ytmusic_capture_{id(handler)}")
     logger.handlers = [handler]
     logger.setLevel(_logging.DEBUG)
     logger.propagate = False

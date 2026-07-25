@@ -1,4 +1,4 @@
-"""YouTube Music (Free) provider for Music Assistant.
+"""YouTube Music provider for Music Assistant.
 
 Streams YouTube Music without a premium subscription by:
 - Using ytmusicapi for search/metadata (optionally with browser cookie auth)
@@ -285,7 +285,7 @@ async def setup(
 ) -> ProviderInstanceType:
     """Initialize provider(instance) with given configuration."""
     # Declare all features upfront — library methods return empty when not authenticated
-    return YoutubeMusicFreeProvider(mass, manifest, config, BASE_FEATURES | AUTHENTICATED_FEATURES)
+    return YoutubeMusicProvider(mass, manifest, config, BASE_FEATURES | AUTHENTICATED_FEATURES)
 
 
 async def get_config_entries(
@@ -533,7 +533,7 @@ async def get_config_entries(
     )
 
 
-class YoutubeMusicFreeProvider(MusicProvider):
+class YoutubeMusicProvider(MusicProvider):
     """Provider for YouTube Music without premium subscription."""
 
     _ytmusic = None
@@ -561,7 +561,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
     _library_seen_nonempty: dict[str, bool]
 
     async def handle_async_init(self) -> None:
-        """Set up the YTMusicFree provider."""
+        """Set up the YTMusic provider."""
         logging.getLogger("yt_dlp").setLevel(logging.WARNING)
         await self._install_packages()
         await self._purge_legacy_auth_file()
@@ -631,7 +631,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     self._authenticated = True
                     self._auth_lapse_warned = False
                     self.logger.info(
-                        "YouTube Music (Free) initialized with cookie authentication — "
+                        "YouTube Music initialized with cookie authentication — "
                         "library sync enabled"
                     )
                 except Exception as err:
@@ -648,7 +648,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             self._ytmusic = await asyncio.to_thread(self._create_ytmusic_client)
 
         if not self._authenticated:
-            self.logger.info("YouTube Music (Free) initialized — anonymous mode")
+            self.logger.info("YouTube Music initialized — anonymous mode")
 
     async def loaded_in_mass(self) -> None:
         """Register native account-mirror and prefetch tasks after provider load."""
@@ -1080,7 +1080,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         Never returns None or an empty string. Music Assistant's
         `default_name` computes a numeric fallback into a local variable but
         then formats `self.instance_name_postfix`, so a None here renders
-        literally as "YouTube Music (Free) [None]" on every instance. The
+        literally as "YouTube Music [None]" on every instance. The
         name is not only cosmetic: playlist owners fall back to it, so it
         would be written into library metadata.
         """

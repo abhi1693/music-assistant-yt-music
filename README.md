@@ -181,7 +181,7 @@ PYTHON_DIR=$(
     grep -m1 '^python3'
 )
 
-docker cp ./ytmusic_free \
+docker cp ./ytmusic \
   "$MA_CONTAINER:/app/venv/lib/$PYTHON_DIR/site-packages/music_assistant/providers/"
 docker restart "$MA_CONTAINER"
 ```
@@ -194,12 +194,12 @@ After installation:
 
 1. Open Music Assistant.
 2. Go to **Settings → Music sources → Add music source**.
-3. Select **YouTube Music (Free)**.
+3. Select **YouTube Music**.
 4. Configure authentication, quality, and caching.
 5. Save the provider.
 
 The provider can be renamed to **YouTube Music** or any other local display
-name without changing its internal `ytmusic_free` domain.
+name without changing its internal `ytmusic` domain.
 
 ## Configuration
 
@@ -470,7 +470,7 @@ direct stream and are not cached.
 
 ### The provider is missing
 
-- Confirm the directory is named `ytmusic_free`.
+- Confirm the directory is named `ytmusic`.
 - Confirm it contains `__init__.py` and `manifest.json`.
 - Confirm it is inside Music Assistant's active Python `site-packages`, not
   merely staged under `/config`.
@@ -538,13 +538,6 @@ direct stream and are not cached.
 - Verify that each provider instance points to the intended account.
 - For multiple signed-in Google accounts, use separate private sessions or the
   correct `X-Goog-AuthUser` account index.
-
-### `ytmusic://` items are skipped
-
-The `ytmusic://` scheme belongs to Music Assistant's official premium provider.
-This provider uses `ytmusic_free://`. Third-party applications must emit the
-correct provider scheme. Rewriting is safe only for raw `track/<video-id>`
-links; other media types use different identifier namespaces.
 
 ## Dependencies
 

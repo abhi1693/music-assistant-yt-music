@@ -7,7 +7,7 @@ on:
   push:
     branches: [ "master" ]
     paths:
-      - 'ytmusic_free/**'
+      - 'ytmusic/**'
       - 'Dockerfile'
       - '.dockerignore'
       - '.github/workflows/docker-publish.yml'

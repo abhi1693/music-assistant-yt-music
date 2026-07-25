@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install the ytmusic_free provider into the running Music Assistant container.
+# Install the ytmusic provider into the running Music Assistant container.
 #
 # Portable across HAOS (BusyBox ash) and Supervised installs. Uses curl + tar
 # instead of git so it runs on HAOS, where git is not available.
@@ -10,8 +10,8 @@
 #                          [--no-restart] [--no-stage]
 #
 # What it does:
-#   1. Downloads ytmusic_free/ from the repository at the requested ref.
-#   2. Stages it at /config/custom_components/mass/providers/ytmusic_free
+#   1. Downloads ytmusic/ from the repository at the requested ref.
+#   2. Stages it at /config/custom_components/mass/providers/ytmusic
 #      (persistent location used by the watcher add-on).
 #   3. Copies it into the live MA container at
 #      /app/venv/lib/<pythonX.Y>/site-packages/music_assistant/providers/.
@@ -22,11 +22,11 @@
 
 set -eu
 
-REPO_OWNER="sproft"
-REPO_NAME="music-assistant-ytmusic"
-PROVIDER_DIR="ytmusic_free"
+REPO_OWNER="abhi1693"
+REPO_NAME="music-assistant-yt-music"
+PROVIDER_DIR="ytmusic"
 
-REF="main"
+REF="master"
 FORCE=0
 MA_ID=""
 PYTHON_VERSION=""
@@ -66,8 +66,8 @@ Usage: sh install_provider.sh [options]
 
 Options:
   --force, -f               Skip overwrite prompts
-  --repo-owner OWNER        Repository owner (default: sproft)
-  --ref REF                 Git ref (branch/tag/commit) to download (default: main)
+  --repo-owner OWNER        Repository owner (default: abhi1693)
+  --ref REF                 Git ref (branch/tag/commit) to download (default: master)
   --ma-id ID                Music Assistant container ID (default: auto-detect)
   --python-version VER      MA Python version, e.g. python3.13 (default: auto-detect)
   --config-dir DIR          /config directory on the host
@@ -236,7 +236,7 @@ Install complete.
 
 Next steps:
   1. Open Music Assistant -> Settings -> Music sources -> Add
-     and select "YouTube Music (Free)".
+     and select "YouTube Music".
   2. (Optional) For library sync, set Authentication to "Browser cookie"
      and paste your music.youtube.com cookie. See README.md -> Authentication.
   3. To survive Home Assistant restarts, install the watcher add-on:

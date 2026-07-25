@@ -25,7 +25,7 @@ Optionally, the watcher can also keep the provider **up to date**: enable `auto_
 ├── watcher_lib.sh       # sourced by run.sh: read_options / provider_src / fetch_latest
 ├── translations/
 │   └── en.yaml          # friendly names/descriptions for the options below
-└── ytmusic_free/
+└── ytmusic/
     ├── __init__.py
     └── manifest.json
 ```
@@ -36,7 +36,7 @@ Optionally, the watcher can also keep the provider **up to date**: enable `auto_
 
 ```yaml
 name: "MA Provider Watcher"
-description: "Re-installs the ytmusic_free provider into Music Assistant after every container restart."
+description: "Re-installs the ytmusic provider into Music Assistant after every container restart."
 version: "1.0.0"  # the installer stamps a fresh "1.0.<timestamp>" on each run so HA detects the change
 slug: ma_provider_watcher
 init: false
@@ -62,10 +62,10 @@ The `options`/`schema` block exposes the [Auto-update](#auto-update) settings in
 # translations/en.yaml
 configuration:
   auto_update:
-    name: Keep the ytmusic_free provider up to date
+    name: Keep the ytmusic provider up to date
     description: >-
       Off by default. When enabled, periodically check GitHub for a newer
-      ytmusic_free provider and reinstall it (restarting Music Assistant) only
+      ytmusic provider and reinstall it (restarting Music Assistant) only
       when the code actually changed. Note this downloads and runs branch-head
       code inside Music Assistant unattended. This is NOT the add-on's own "Auto
       update" control on the Info tab, which updates the watcher add-on itself;
@@ -100,7 +100,7 @@ FROM $BUILD_FROM
 
 RUN apk add --no-cache docker-cli bash curl tar jq
 
-COPY ytmusic_free/ /provider/ytmusic_free/
+COPY ytmusic/ /provider/ytmusic/
 
 COPY run.sh /run.sh
 RUN chmod +x /run.sh && sed -i 's/\r//' /run.sh
@@ -116,7 +116,7 @@ ENTRYPOINT ["/run.sh"]
 #!/usr/bin/env bash
 
 MA="addon_d5369777_music_assistant"
-SRC="/provider/ytmusic_free"
+SRC="/provider/ytmusic"
 DST="/app/venv/lib/python3.13/site-packages/music_assistant/providers"
 
 echo "[$(date)] MA Provider Watcher starting..."
@@ -129,7 +129,7 @@ fi
 echo "[$(date)] Docker OK"
 
 install_provider() {
-    echo "[$(date)] Installing ytmusic_free provider..."
+    echo "[$(date)] Installing ytmusic provider..."
     sleep 3
     docker cp "$SRC" "$MA:$DST/" && echo "[$(date)] Copied OK" || { echo "[$(date)] ERROR: cp failed"; return 1; }
     docker restart "$MA" && echo "[$(date)] MA restarted" || echo "[$(date)] ERROR: restart failed"
@@ -173,7 +173,7 @@ done
 For most users the [`scripts/install_watcher_addon.sh`](scripts/install_watcher_addon.sh) installer handles steps 1-3 below automatically:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main/scripts/install_watcher_addon.sh | sh
+curl -fsSL https://raw.githubusercontent.com/abhi1693/music-assistant-yt-music/master/scripts/install_watcher_addon.sh | sh
 ```
 
 The script is POSIX `sh` (works on HAOS BusyBox `ash`), uses `curl + tar` instead of `git`, auto-detects the local add-ons path (HAOS `apps/local` and legacy `addons/local`, Supervised, and the in-add-on `/addons` mapping), and tries to detect the MA container ID and Python venv version. After it finishes, jump to [step 4 (Install the add-on)](#4-install-the-add-on) below.
@@ -184,7 +184,7 @@ The script is POSIX `sh` (works on HAOS BusyBox `ash`), uses `curl + tar` instea
 
 Common flags:
 - `--force`: overwrite an existing install without prompting
-- `--ref TAG`: pin to a release tag instead of `main`
+- `--ref TAG`: pin to a release tag instead of `master`
 - `--ma-id ID` / `--python-version pythonX.Y`: override auto-detection
 - `--addons-dir DIR`: skip path auto-detection (useful for non-standard installs)
 
@@ -193,7 +193,7 @@ Run `sh install_watcher_addon.sh --help` to see all options.
 > **Passing flags through `curl | sh`:** if you re-run the one-liner with a flag, use `sh -s --` as a separator so the flag goes to the script and not to `sh` itself:
 >
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main/scripts/install_watcher_addon.sh | sh -s -- --force
+> curl -fsSL https://raw.githubusercontent.com/abhi1693/music-assistant-yt-music/master/scripts/install_watcher_addon.sh | sh -s -- --force
 > ```
 >
 > `curl ... | sh --force` parses `--force` as a shell option and fails with `sh: bad option '--force'`.
@@ -227,13 +227,13 @@ mkdir -p /addons/ma_provider_watcher
 
 ### 2. Copy the provider files
 
-Copy the `ytmusic_free` provider folder into the add-on directory (use whichever
+Copy the `ytmusic` provider folder into the add-on directory (use whichever
 path matches your shell from the table above: `/addons/...` inside the SSH/Samba
 add-on, or the `/mnt/data/supervisor/...` host path from the HAOS console):
 
 ```bash
 # Inside the SSH / Samba add-on
-cp -r /path/to/ytmusic_free /addons/ma_provider_watcher/ytmusic_free
+cp -r /path/to/ytmusic /addons/ma_provider_watcher/ytmusic
 ```
 
 ### 3. Create the add-on files
@@ -265,10 +265,10 @@ Polling for MA container changes every 10s...
 
 ## Updating the provider
 
-When you update the `ytmusic_free` provider code, copy the new files into the add-on directory and rebuild (path as in the table above: `/addons/...` inside the SSH/Samba add-on):
+When you update the `ytmusic` provider code, copy the new files into the add-on directory and rebuild (path as in the table above: `/addons/...` inside the SSH/Samba add-on):
 
 ```bash
-cp -r /path/to/ytmusic_free /addons/ma_provider_watcher/ytmusic_free
+cp -r /path/to/ytmusic /addons/ma_provider_watcher/ytmusic
 ha apps rebuild local_ma_provider_watcher
 ha apps restart local_ma_provider_watcher
 ```
@@ -280,7 +280,7 @@ Or let the watcher do it for you, see [Auto-update](#auto-update).
 <a id="auto-update"></a>
 ## Auto-update
 
-The watcher can keep the provider current on its own, so you don't have to manually copy files and rebuild every time `ytmusic_free` changes upstream.
+The watcher can keep the provider current on its own, so you don't have to manually copy files and rebuild every time `ytmusic` changes upstream.
 
 ### Options
 
@@ -291,12 +291,12 @@ Set these in the add-on's **Configuration** tab (or `options` in `config.yaml`):
 | `auto_update` | bool | `false` | Off by default (opt-in). When on, the watcher periodically checks GitHub for a newer provider and reinstalls it. Note it then runs branch-head code inside MA unattended. Leave off to pin to the version baked into the image. |
 | `update_interval_hours` | int (hours) | `24` | How often to check. `24` = daily, `168` = weekly, `1` = hourly. Clamped to a minimum of `1` at runtime; invalid values fall back to the default. |
 
-Auto-update follows the **branch head** given by `--ref` (default `main`); it does not resolve tags or commit SHAs.
+Auto-update follows the **branch head** given by `--ref` (default `master`); it does not resolve tags or commit SHAs.
 
 ### How it works
 
-1. On startup (and every `update_interval_hours` hours thereafter), the watcher downloads the provider tarball for the configured `--ref` (default `main`) from GitHub into a cache under `/data`.
-2. It compares the SHA-256 of the fetched `ytmusic_free/` against what's already cached.
+1. On startup (and every `update_interval_hours` hours thereafter), the watcher downloads the provider tarball for the configured `--ref` (default `master`) from GitHub into a cache under `/data`.
+2. It compares the SHA-256 of the fetched `ytmusic/` against what's already cached.
 3. **Only if the code changed**, it copies the new files into the MA container and restarts MA. Unchanged fetches are a no-op, so no needless restarts.
 4. If a fetch fails (offline, GitHub down), the watcher logs a warning and keeps using the currently installed version. It never leaves MA without a provider.
 
@@ -307,7 +307,7 @@ Once a newer version has been cached, it also survives MA container recreation: 
 With auto-update active you'll see lines such as:
 
 ```
-provider source: /data/ytmusic_free
+provider source: /data/ytmusic
 auto-update: new provider version detected -> reinstalling
 ```
 
@@ -321,7 +321,7 @@ If `auto_update` is `false`, the watcher behaves exactly as before (re-inject on
 - Turn **Protection mode OFF** in the add-on settings. This is the most common issue.
 
 **`lstat /provider: no such file or directory`**
-- The `ytmusic_free/` folder is missing from the add-on directory. Copy it and rebuild.
+- The `ytmusic/` folder is missing from the add-on directory. Copy it and rebuild.
 
 **`could not find local add-ons directory. Pass --addons-dir explicitly.`**
 - The installer probed the known locations and none existed in your shell. Most often this is HAOS 18+, where the path moved from `addons/local` to `apps/local`.

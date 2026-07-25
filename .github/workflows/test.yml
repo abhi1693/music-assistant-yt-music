@@ -115,7 +115,7 @@ jobs:
             
             [ -z "$PYVER" ] && PYVER="python3.13"
             
-            TARGET_DIR="/app/venv/lib/$PYVER/site-packages/music_assistant/providers/ytmusic_free"
+            TARGET_DIR="/app/venv/lib/$PYVER/site-packages/music_assistant/providers/ytmusic"
             echo "Checking path: $TARGET_DIR"
             if [ -d "$TARGET_DIR" ] && [ -f "$TARGET_DIR/manifest.json" ]; then
               echo "Success: Provider files verified in venv."

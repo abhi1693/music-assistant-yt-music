@@ -53,7 +53,7 @@ class PostgresCacheCatalog:
             min_size=1,
             max_size=2,
             command_timeout=15,
-            server_settings={"application_name": "music-assistant-ytmusic-cache"},
+            server_settings={"application_name": "music-assistant-yt-music-cache"},
         )
         catalog = cls(pool, provider_instance_id, logger)
         await catalog.migrate()

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install the MA Provider Watcher add-on for the ytmusic_free provider.
+# Install the MA Provider Watcher add-on for the ytmusic provider.
 #
 # Portable across HAOS (BusyBox ash) and Supervised installs. Uses curl + tar
 # instead of git so it runs on HAOS, where git is not available.
@@ -12,8 +12,8 @@
 
 set -eu
 
-REPO_OWNER="sproft"
-REPO_NAME="music-assistant-ytmusic"
+REPO_OWNER="abhi1693"
+REPO_NAME="music-assistant-yt-music"
 ADDON_SLUG="ma_provider_watcher"
 ADDON_NAME="MA Provider Watcher"
 # Stamp a fresh, strictly-increasing version on every run so Home Assistant sees
@@ -22,7 +22,7 @@ ADDON_NAME="MA Provider Watcher"
 # silently keeps the stale cached image with the old run.sh -- issue #22.
 ADDON_VERSION="1.0.$(date +%Y%m%d%H%M%S)"
 
-REF="main"
+REF="master"
 FORCE=0
 MA_ID=""
 PYTHON_VERSION=""
@@ -51,8 +51,8 @@ Usage: sh install_watcher_addon.sh [options]
 
 Options:
   --force, -f               Overwrite existing add-on directory without prompting
-  --repo-owner OWNER        Repository owner (default: sproft)
-  --ref REF                 Branch to download; auto-update follows this branch head (default: main)
+  --repo-owner OWNER        Repository owner (default: abhi1693)
+  --ref REF                 Branch to download; auto-update follows this branch head (default: master)
   --ma-id ID                Music Assistant container ID (default: auto-detect)
   --python-version VER      MA Python version, e.g. python3.13 (default: auto-detect)
   --addons-dir DIR          Local add-ons directory (default: auto-detect HAOS vs. Supervised)
@@ -190,7 +190,7 @@ fi
 TMPDIR="$(mktemp -d 2>/dev/null || mktemp -d -t maw)"
 trap 'rm -rf "$TMPDIR"' EXIT INT TERM
 
-TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REF"
+TARBALL_URL="${YTMUSIC_TARBALL_URL_OVERRIDE:-https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REF}"
 log "Downloading $TARBALL_URL"
 curl -fsSL "$TARBALL_URL" -o "$TMPDIR/repo.tar.gz" \
     || die "download failed (check --ref or your network)"
@@ -202,14 +202,14 @@ tar -xzf "$TMPDIR/repo.tar.gz" -C "$TMPDIR" \
 # Tarball top-level dir is "<repo>-<ref>" with slashes in ref replaced by '-'.
 SAFE_REF="$(printf '%s' "$REF" | tr '/' '-')"
 SRC_ROOT="$TMPDIR/$REPO_NAME-$SAFE_REF"
-[ -d "$SRC_ROOT/ytmusic_free" ] \
-    || die "ytmusic_free/ not found in archive at $SRC_ROOT"
+[ -d "$SRC_ROOT/ytmusic" ] \
+    || die "ytmusic/ not found in archive at $SRC_ROOT"
 
 # --- Build the add-on directory ---------------------------------------------
 
 log "Creating $ADDON_DIR"
 mkdir -p "$ADDON_DIR"
-cp -R "$SRC_ROOT/ytmusic_free" "$ADDON_DIR/ytmusic_free"
+cp -R "$SRC_ROOT/ytmusic" "$ADDON_DIR/ytmusic"
 
 # Guard values that get interpolated into run.sh (unquoted heredoc) + TARBALL_URL
 # against shell metacharacters, so operator input can't inject code into the
@@ -224,7 +224,7 @@ done
 log "Writing config.yaml"
 cat > "$ADDON_DIR/config.yaml" <<EOF
 name: "$ADDON_NAME"
-description: "Re-installs the ytmusic_free provider into Music Assistant after every container restart."
+description: "Re-installs the ytmusic provider into Music Assistant after every container restart."
 version: "$ADDON_VERSION"
 slug: $ADDON_SLUG
 init: false
@@ -249,10 +249,10 @@ mkdir -p "$ADDON_DIR/translations"
 cat > "$ADDON_DIR/translations/en.yaml" <<'EOF'
 configuration:
   auto_update:
-    name: Keep the ytmusic_free provider up to date
+    name: Keep the ytmusic provider up to date
     description: >-
       Off by default. When enabled, periodically check GitHub for a newer
-      ytmusic_free provider and reinstall it (restarting Music Assistant) only
+      ytmusic provider and reinstall it (restarting Music Assistant) only
       when the code actually changed. Note this downloads and runs branch-head
       code inside Music Assistant unattended. This is NOT the add-on's own "Auto
       update" control on the Info tab, which updates the watcher add-on itself;
@@ -281,7 +281,7 @@ FROM $BUILD_FROM
 
 RUN apk add --no-cache docker-cli bash curl tar jq
 
-COPY ytmusic_free/ /provider/ytmusic_free/
+COPY ytmusic/ /provider/ytmusic/
 
 COPY watcher_lib.sh /watcher_lib.sh
 COPY run.sh /run.sh
@@ -330,9 +330,9 @@ fetch_latest() {
     if ! tar -xzf "$tmp/p.tgz" -C "$tmp" 2>/dev/null; then
         echo "auto-update: extract failed"; rm -rf "$tmp"; return 1
     fi
-    nd="$(find "$tmp" -maxdepth 3 -type d -name ytmusic_free 2>/dev/null | head -n1)"
+    nd="$(find "$tmp" -maxdepth 3 -type d -name ytmusic 2>/dev/null | head -n1)"
     if [ -z "$nd" ]; then
-        echo "auto-update: ytmusic_free not found in tarball"; rm -rf "$tmp"; return 1
+        echo "auto-update: ytmusic not found in tarball"; rm -rf "$tmp"; return 1
     fi
     # hash file contents by RELATIVE path (cd into $nd) so a random tmp dir name
     # doesn't change the digest -> stable across fetches of identical code
@@ -354,9 +354,9 @@ cat > "$ADDON_DIR/run.sh" <<EOF
 #!/usr/bin/env bash
 
 MA="$MA_ID"
-BUNDLED="/provider/ytmusic_free"
-CACHE="/data/ytmusic_free"
-HASHFILE="/data/ytmusic_free.sha256"
+BUNDLED="/provider/ytmusic"
+CACHE="/data/ytmusic"
+HASHFILE="/data/ytmusic.sha256"
 DST="/app/venv/lib/$PYTHON_VERSION/site-packages/music_assistant/providers"
 # Where auto-update pulls the latest provider from. Baked from the installer's
 # --repo-owner/--ref so a fork self-updates from its own source.
@@ -387,12 +387,12 @@ log() { echo "[\$(date)] \$*"; }
 
 install_provider() {
     src="\$(provider_src)"
-    echo "[\$(date)] Installing ytmusic_free provider from \$src ..."
+    echo "[\$(date)] Installing ytmusic provider from \$src ..."
     sleep 3
     # Clear any stale in-place copy so docker cp is a clean replace, not a merge:
     # files deleted upstream would otherwise linger across periodic auto-updates
     # (docker restart keeps the container filesystem). Mirrors install_provider.sh.
-    docker exec "\$MA" rm -rf "\$DST/ytmusic_free" 2>/dev/null || true
+    docker exec "\$MA" rm -rf "\$DST/ytmusic" 2>/dev/null || true
     docker cp "\$src" "\$MA:\$DST/" && echo "[\$(date)] Copied OK" || { echo "[\$(date)] ERROR: cp failed"; return 1; }
     docker restart "\$MA" && echo "[\$(date)] MA restarted" || echo "[\$(date)] ERROR: restart failed"
 }

@@ -4,8 +4,8 @@
 #
 # Run from the repo root:   sh tests/test_watcher_autoupdate.sh
 #
-# Generating the add-on downloads the provider from GitHub; if that fails
-# (offline) the whole suite auto-skips. Set SKIP_NETWORK_TESTS=1 to skip.
+# The generated add-on is built from a local provider archive so the suite
+# exercises the current checkout rather than whichever revision is on GitHub.
 
 set -u
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -24,9 +24,15 @@ if ! command -v sha256sum >/dev/null 2>&1 && command -v shasum >/dev/null 2>&1; 
 fi
 
 TMP_ADDONS="$(mktemp -d)"
-if [ "${SKIP_NETWORK_TESTS:-0}" = "1" ] || ! sh "$SCRIPT" --force \
+FIXTURE_ROOT="$TMP_ADDONS/music-assistant-yt-music-master"
+FIXTURE_ARCHIVE="$TMP_ADDONS/provider-fixture.tar.gz"
+mkdir -p "$FIXTURE_ROOT"
+cp -R "$REPO_ROOT/ytmusic" "$FIXTURE_ROOT/ytmusic"
+tar -czf "$FIXTURE_ARCHIVE" -C "$TMP_ADDONS" music-assistant-yt-music-master
+rm -rf "$FIXTURE_ROOT"
+if ! YTMUSIC_TARBALL_URL_OVERRIDE="file://$FIXTURE_ARCHIVE" sh "$SCRIPT" --force \
         --addons-dir "$TMP_ADDONS" --ma-id addon_test --python-version python3.14 >/dev/null 2>&1; then
-    skip "could not generate add-on (offline or skipped) -- auto-update tests skipped"
+    skip "could not generate add-on -- auto-update tests skipped"
     printf '\n== Summary ==\n  passed: %s\n  failed: %s\n  skipped: %s\n' "$PASS" "$FAIL" "$SKIP"
     exit 0
 fi
@@ -77,15 +83,15 @@ result="$(
     CACHE="$W/cache"; BUNDLED="$W/bundled"; HASHFILE="$W/hash"
     mkdir -p "$BUNDLED"; echo bundled > "$BUNDLED/x"
     src1="$(provider_src)"                                   # no cache -> bundled
-    mkdir -p "$W/ytmusic_free"; echo v1 > "$W/ytmusic_free/__init__.py"
-    ( cd "$W" && tar -czf pkg.tgz ytmusic_free )
+    mkdir -p "$W/ytmusic"; echo v1 > "$W/ytmusic/__init__.py"
+    ( cd "$W" && tar -czf pkg.tgz ytmusic )
     TARBALL_URL="file://$W/pkg.tgz"
     fetch_latest >/dev/null 2>&1; r1=$?                      # new -> 0
     src2="$(provider_src)"                                   # auto-update on + cache -> cache
     # Opting OUT must revert to the bundled copy even with a cache present.
     AUTO_UPDATE=false; src_off="$(provider_src)"; AUTO_UPDATE=true
     fetch_latest >/dev/null 2>&1; r2=$?                      # unchanged -> 2
-    echo v2 > "$W/ytmusic_free/__init__.py"; ( cd "$W" && tar -czf pkg.tgz ytmusic_free )
+    echo v2 > "$W/ytmusic/__init__.py"; ( cd "$W" && tar -czf pkg.tgz ytmusic )
     fetch_latest >/dev/null 2>&1; r3=$?                      # changed -> 0
     [ "$src1" = "$BUNDLED" ] && [ "$src2" = "$CACHE" ] && [ "$src_off" = "$BUNDLED" ] && echo "$r1 $r2 $r3"
 )"

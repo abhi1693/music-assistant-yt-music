@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from ytmusic_free.catalog import CacheJob, CachedEntry, PostgresCacheCatalog
+from ytmusic.catalog import CacheJob, CachedEntry, PostgresCacheCatalog
 
 
 class FakePool:
@@ -57,15 +57,15 @@ class TransactionalFakePool(FakePool):
 
 def test_enqueue_is_instance_scoped_and_idempotent():
     pool = FakePool()
-    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+    catalog = PostgresCacheCatalog(pool, "ytmusic--home", logging.getLogger())
 
     asyncio.run(catalog.enqueue(["first", "second"], priority=25))
 
     query, rows = pool.calls[0]
     assert "ON CONFLICT" in query
     assert rows == (
-        ("ytmusic_free--home", "first", 25),
-        ("ytmusic_free--home", "second", 25),
+        ("ytmusic--home", "first", 25),
+        ("ytmusic--home", "second", 25),
     )
 
 
@@ -80,7 +80,7 @@ def test_claim_uses_skip_locked_and_returns_attempt_count():
             "cache_path": "/cache/first.webm",
         }
     ]
-    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+    catalog = PostgresCacheCatalog(pool, "ytmusic--home", logging.getLogger())
 
     jobs = asyncio.run(catalog.claim(10))
 
@@ -96,12 +96,12 @@ def test_claim_uses_skip_locked_and_returns_attempt_count():
     query, args = pool.calls[0]
     assert "FOR UPDATE SKIP LOCKED" in query
     assert "lease_until" in query
-    assert args == ("ytmusic_free--home", 10)
+    assert args == ("ytmusic--home", 10)
 
 
 def test_reconcile_imports_completed_files_as_cached():
     pool = FakePool()
-    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+    catalog = PostgresCacheCatalog(pool, "ytmusic--home", logging.getLogger())
 
     asyncio.run(
         catalog.reconcile_cached(
@@ -112,7 +112,7 @@ def test_reconcile_imports_completed_files_as_cached():
     query, rows = pool.calls[0]
     assert "'cached'" in query
     assert rows == (
-        ("ytmusic_free--home", "track", "/cache/track.webm", 1234, "webm"),
+        ("ytmusic--home", "track", "/cache/track.webm", 1234, "webm"),
     )
     assert "upgrade_requested" in query
 
@@ -126,19 +126,19 @@ def test_list_cached_returns_rows_that_must_have_files():
             "bitrate": 138,
         }
     ]
-    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+    catalog = PostgresCacheCatalog(pool, "ytmusic--home", logging.getLogger())
 
     rows = asyncio.run(catalog.list_cached())
 
     assert rows == [CachedEntry("track", "/cache/track.webm", 138)]
     query, args = pool.calls[0]
     assert "status = 'cached' OR upgrade_requested" in query
-    assert args == ("ytmusic_free--home",)
+    assert args == ("ytmusic--home",)
 
 
 def test_missing_cache_files_are_requeued_and_metadata_is_cleared():
     pool = FakePool()
-    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+    catalog = PostgresCacheCatalog(pool, "ytmusic--home", logging.getLogger())
 
     asyncio.run(catalog.requeue_missing(["first", "second"]))
 
@@ -146,13 +146,13 @@ def test_missing_cache_files_are_requeued_and_metadata_is_cleared():
     assert "status = 'pending'" in query
     assert "cache_path = NULL" in query
     assert "upgrade_requested = false" in query
-    assert args == ("ytmusic_free--home", ["first", "second"])
+    assert args == ("ytmusic--home", ["first", "second"])
 
 
 def test_quality_upgrade_scheduler_is_bounded_and_cooled_down():
     pool = FakePool()
     pool.claim_rows = [{"track_id": "first"}]
-    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+    catalog = PostgresCacheCatalog(pool, "ytmusic--home", logging.getLogger())
 
     count = asyncio.run(catalog.schedule_quality_upgrades(256, 100, 30))
 
@@ -162,19 +162,19 @@ def test_quality_upgrade_scheduler_is_bounded_and_cooled_down():
     assert "quality_checked_at" in query
     assert "upgrade_requested = true" in query
     assert "FOR UPDATE SKIP LOCKED" in query
-    assert args == ("ytmusic_free--home", 256, 100, 30)
+    assert args == ("ytmusic--home", 256, 100, 30)
 
 
 def test_retry_records_sanitized_error_and_bounded_delay():
     pool = FakePool()
-    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+    catalog = PostgresCacheCatalog(pool, "ytmusic--home", logging.getLogger())
 
     asyncio.run(catalog.mark_retry("track", "ClientResponseError HTTP 403", 20))
 
     update_query, update_args = pool.calls[0]
     assert "attempt_count >= 10" in update_query
     assert update_args == (
-        "ytmusic_free--home",
+        "ytmusic--home",
         "ClientResponseError HTTP 403",
         21600,
         "track",
@@ -184,7 +184,7 @@ def test_retry_records_sanitized_error_and_bounded_delay():
 
 def test_close_closes_pool():
     pool = FakePool()
-    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+    catalog = PostgresCacheCatalog(pool, "ytmusic--home", logging.getLogger())
 
     asyncio.run(catalog.close())
 
@@ -193,7 +193,7 @@ def test_close_closes_pool():
 
 def test_account_snapshot_is_instance_scoped_and_soft_removes_absences():
     pool = TransactionalFakePool()
-    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+    catalog = PostgresCacheCatalog(pool, "ytmusic--home", logging.getLogger())
 
     asyncio.run(
         catalog.replace_account_collection(
@@ -216,12 +216,12 @@ def test_account_snapshot_is_instance_scoped_and_soft_removes_absences():
     assert "ytmusic_account_relations" in statements
     assert "removed_at = now()" in statements
     assert "ytmusic_account_sync_runs" in statements
-    assert "ytmusic_free--home" in repr(pool.calls)
+    assert "ytmusic--home" in repr(pool.calls)
 
 
 def test_prefetch_cooldown_is_durable_and_scoped_to_provider():
     pool = FakePool()
-    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+    catalog = PostgresCacheCatalog(pool, "ytmusic--home", logging.getLogger())
 
     asyncio.run(catalog.set_cooldown(21600, "YouTube bot challenge"))
 
@@ -229,7 +229,7 @@ def test_prefetch_cooldown_is_durable_and_scoped_to_provider():
     assert "ytmusic_cache_controls" in query
     assert "ON CONFLICT" in query
     assert args == (
-        "ytmusic_free--home",
+        "ytmusic--home",
         21600,
         "YouTube bot challenge",
     )
