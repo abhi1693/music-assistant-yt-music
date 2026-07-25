@@ -994,6 +994,9 @@ def test_completed_stream_is_cached_and_reused(provider, tmp_path):
         details = await provider.get_stream_details("dQw4w9WgXcQ", MediaType.TRACK)
         assert details.stream_type == StreamType.CUSTOM
         assert details.data["cache_path"].endswith(".m4a")
+        assert details.data["playback_source"] == "youtube"
+        assert details.data["playback_source_label"] == "YouTube Music"
+        assert details.data["cache_hit"] is False
         chunks = [chunk async for chunk in provider.get_audio_stream(details)]
         return b"".join(chunks)
 
@@ -1012,6 +1015,9 @@ def test_completed_stream_is_cached_and_reused(provider, tmp_path):
     assert cached.stream_type == StreamType.LOCAL_FILE
     assert cached.path.endswith(".m4a")
     assert cached.expiration == 0
+    assert cached.data["playback_source"] == "local_cache"
+    assert cached.data["playback_source_label"] == "Local cache"
+    assert cached.data["cache_hit"] is True
     assert open(cached.path, "rb").read() == b"first play"
     provider._cache_writers = set()  # simulate fresh provider state after restart
     persisted = asyncio.run(
@@ -1040,13 +1046,21 @@ def test_preloaded_stream_details_recheck_completed_cache(provider, tmp_path):
         item_id="dQw4w9WgXcQ",
         stream_type=StreamType.CUSTOM,
         path="https://stream.example/audio",
-        data={"cache_path": str(cache_path)},
+        data={
+            "cache_path": str(cache_path),
+            "playback_source": "youtube",
+            "playback_source_label": "YouTube Music",
+            "cache_hit": False,
+        },
     )
 
     async def consume():
         return b"".join([chunk async for chunk in provider.get_audio_stream(details)])
 
     assert asyncio.run(consume()) == b"already cached"
+    assert details.data["playback_source"] == "local_cache"
+    assert details.data["playback_source_label"] == "Local cache"
+    assert details.data["cache_hit"] is True
     assert not (tmp_path / "track.webm.part").exists()
 
 

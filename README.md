@@ -440,11 +440,16 @@ direct stream and are not cached.
 
 ### Confirming that playback uses the persistent cache
 
-- Look for `Serving YouTube Music track ... from persistent cache ...` in Music
-  Assistant logs.
+- Look for `Playback source: Local cache` in Music Assistant logs.
+- Cached stream details carry `playback_source=local_cache`,
+  `playback_source_label=Local cache`, and `cache_hit=true`. Remote first-play
+  details carry the corresponding `youtube`, `YouTube Music`, and `false`
+  values. This stable provenance contract is intended for diagnostics and for
+  Music Assistant UI support when it exposes provider-defined stream data.
 - A cache hit does not create or grow a `.part` file.
-- The Music Assistant signal-path panel shows the provider and codec, not
-  whether transport came from YouTube or a local file.
+- The Music Assistant signal-path panel does not expose provider-defined
+  transport provenance in the current release; use the explicit log until that
+  UI supports it.
 - `Quality unknown` can appear for a local cache hit because the cached
   `LOCAL_FILE` response does not currently persist the original bitrate as
   metadata; it is not proof of an upstream request.

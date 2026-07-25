@@ -1315,7 +1315,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             and cached_path is not None
         ):
             self.logger.info(
-                "Serving YouTube Music track %s from persistent cache %s",
+                "Playback source: Local cache; YouTube Music track=%s path=%s",
                 video_id,
                 cached_path,
             )
@@ -1331,6 +1331,12 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 path=cached_path,
                 can_seek=True,
                 allow_seek=True,
+                data={
+                    "playback_source": "local_cache",
+                    "playback_source_label": "Local cache",
+                    "cache_hit": True,
+                    "cache_path": cached_path,
+                },
                 # MA retains StreamDetails and their decoded AudioBuffer. An active
                 # buffer may safely finish after an operator removes the source
                 # file, but the next buffer must ask us to recheck disk instead of
@@ -1381,6 +1387,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 "http_headers": stream_format.get("http_headers") or {},
                 "cache_path": cache_path,
                 "expected_size": stream_format.get("filesize"),
+                "playback_source": "youtube",
+                "playback_source_label": "YouTube Music",
+                "cache_hit": False,
             },
         )
         if channels := stream_format.get("audio_channels"):
@@ -1437,10 +1446,18 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 cached_reader = await asyncio.to_thread(open, cache_path, "rb")
         if cached_reader is not None:
             self.logger.info(
-                "Serving preloaded YouTube Music track %s from persistent cache %s",
+                "Playback source: Local cache; preloaded YouTube Music track=%s path=%s",
                 streamdetails.item_id,
                 cache_path,
             )
+            data.update(
+                {
+                    "playback_source": "local_cache",
+                    "playback_source_label": "Local cache",
+                    "cache_hit": True,
+                }
+            )
+            streamdetails.data = data
             try:
                 while chunk := await asyncio.to_thread(cached_reader.read, 64 * 1024):
                     yield chunk
