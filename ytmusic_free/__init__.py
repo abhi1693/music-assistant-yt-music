@@ -1288,6 +1288,21 @@ class YoutubeMusicFreeProvider(MusicProvider):
         cache_path = str(
             data.get("cache_path") or self._cache_path(streamdetails.item_id, "audio")
         )
+        # Music Assistant can resolve and preload StreamDetails before the prior
+        # play finishes. By the time this generator starts, that prior request may
+        # already have published the completed file. Recheck the exact target here
+        # so stale details do not open a new .part and download the track again.
+        cached_reader = None
+        if os.path.isfile(cache_path):
+            with suppress(OSError):
+                cached_reader = await asyncio.to_thread(open, cache_path, "rb")
+        if cached_reader is not None:
+            try:
+                while chunk := await asyncio.to_thread(cached_reader.read, 64 * 1024):
+                    yield chunk
+            finally:
+                await asyncio.to_thread(cached_reader.close)
+            return
         headers = {
             str(key): str(value)
             for key, value in (data.get("http_headers") or {}).items()

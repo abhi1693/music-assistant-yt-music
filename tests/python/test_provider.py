@@ -1014,6 +1014,35 @@ def test_completed_stream_is_cached_and_reused(provider, tmp_path):
     assert persisted.path == cached.path
 
 
+def test_preloaded_stream_details_recheck_completed_cache(provider, tmp_path):
+    """Details resolved before publication must not redownload after publication."""
+
+    cache_path = tmp_path / "track.webm"
+    cache_path.write_bytes(b"already cached")
+
+    class Session:
+        def get(self, _url, headers=None):
+            raise AssertionError("completed cache should prevent an upstream request")
+
+    provider.mass = SimpleNamespace(http_session=Session())
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+    provider._cache_writers = set()
+    details = StreamDetails(
+        provider=provider.instance_id,
+        item_id="dQw4w9WgXcQ",
+        stream_type=StreamType.CUSTOM,
+        path="https://stream.example/audio",
+        data={"cache_path": str(cache_path)},
+    )
+
+    async def consume():
+        return b"".join([chunk async for chunk in provider.get_audio_stream(details)])
+
+    assert asyncio.run(consume()) == b"already cached"
+    assert not (tmp_path / "track.webm.part").exists()
+
+
 def test_interrupted_stream_does_not_publish_partial_cache(provider, tmp_path):
     """A stopped first play leaves no file that could be mistaken for a hit."""
 
