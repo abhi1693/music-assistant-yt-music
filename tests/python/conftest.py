@@ -130,6 +130,8 @@ def _install_music_assistant_models() -> None:
 
     class _StreamType(str, Enum):
         HTTP = "http"
+        CUSTOM = "custom"
+        LOCAL_FILE = "local_file"
 
     enums.AlbumType = _AlbumType
     enums.ConfigEntryType = _ConfigEntryType
@@ -314,6 +316,7 @@ def _install_music_assistant_models() -> None:
         expiration: int = 0
         duration: int | None = None
         extra_input_args: list = field(default_factory=list)
+        data: dict = field(default_factory=dict)
 
     streamdetails.StreamDetails = _StreamDetails
 

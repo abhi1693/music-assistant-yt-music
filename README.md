@@ -1,6 +1,7 @@
 # YouTube Music (Free): Music Assistant Provider
 
-A custom Music Assistant provider that streams YouTube Music **without a premium subscription**, using the same technique as open-source players like [SimpMusic](https://github.com/maxrave-dev/SimpMusic).
+A custom Music Assistant provider that streams YouTube Music **without a premium
+subscription** and keeps completed first plays on persistent local storage.
 
 ## How it works
 
@@ -8,10 +9,18 @@ A custom Music Assistant provider that streams YouTube Music **without a premium
 |-----------|------|
 | `ytmusicapi` | Search, metadata, and library sync (optional auth) |
 | `yt-dlp` | Extract direct audio stream URLs and playlist tracks |
+| Read-through cache | Tee the first complete play to disk and serve later plays locally |
 
 Audio stream URLs are resolved without a login. Which of YouTube's internal clients does that resolving is left to yt-dlp's own defaults rather than pinned here, because the client that works anonymously keeps moving: the Android Music client this provider originally named has since been removed from yt-dlp entirely, and the Android and iOS clients now require a PO token, which an anonymous session cannot supply. yt-dlp tracks that target for us. This is the same general approach used by NewPipe and SimpMusic on Android.
 
 For playlists, `yt-dlp` is used as a fallback when `ytmusicapi` cannot parse the unauthenticated playlist response from YouTube, ensuring playlists work without a login.
+
+For an untrimmed track that is not cached, the provider uses Music Assistant's
+custom stream interface to make one upstream request. Each byte is sent to the
+player and written to a temporary file. The file becomes visible to subsequent
+plays only after the upstream stream reaches EOF and is flushed to disk. If
+playback stops or the request fails, the partial file is removed. This avoids
+doubling bandwidth on the first play and avoids serving corrupt partial media.
 
 > **Note:** This uses YouTube's internal (unofficial) API. It may break if Google changes their API. Premium-exclusive content (offline, high-res audio) is not accessible.
 
@@ -25,7 +34,7 @@ The Music Assistant maintainers have stated more than once that they do not want
 
 - Do not open issues, discussions, or support requests about this provider on the Music Assistant repositories, Discord, or forum.
 - Do not mention this provider when reporting an unrelated Music Assistant bug. If you hit a problem in Music Assistant itself, reproduce it with this provider removed before reporting it upstream.
-- Report anything about this provider here, on this repository's [issue tracker](https://github.com/sproft/music-assistant-ytmusic/issues).
+- Report anything about this provider here, on this repository's [issue tracker](https://github.com/abhi1693/music-assistant-yt-music/issues).
 
 Keeping these reports here respects the Music Assistant team's wishes and keeps them out of a project they have asked not to be involved with.
 
@@ -118,7 +127,11 @@ Go to **Settings → Apps → Add** in the MA UI. You should see **"YouTube Musi
 
 ### Adding more than one account
 
-The provider is multi-instance, so you can add it several times and give each entry its own cookie, brand account ID, and audio quality setting. Repeat the step above once per account. Music Assistant labels the entries automatically once there is more than one, using the brand account ID where you set one, and you can rename any of them in its settings.
+The provider is multi-instance, so you can add it several times and give each
+entry its own cookie, brand account ID, audio quality setting, and cache path.
+Repeat the step above once per account. Music Assistant labels the entries
+automatically once there is more than one, using the brand account ID where you
+set one, and you can rename any of them in its settings.
 
 Typical reasons to run more than one:
 
@@ -204,6 +217,7 @@ Your cookie is stored by Music Assistant itself, in the encrypted provider confi
 | Add by pasting a YouTube / YTM link | ✅ | ✅ |
 | Trim a video with `@start-end` timestamps | ✅ | ✅ |
 | Stream audio | ✅ | ✅ |
+| Cache completed first plays locally | ✅ | ✅ |
 | Artist top tracks / albums | ✅ | ✅ |
 | Similar tracks (song radio) | ✅ | ✅ |
 | Album / playlist tracks | ✅ | ✅ |
@@ -213,6 +227,25 @@ Your cookie is stored by Music Assistant itself, in the encrypted provider confi
 | Library editing (add/remove) | ❌ | ✅ |
 | Multiple accounts side by side | ✅ | ✅ |
 | Podcast support | ❌ | ❌ |
+
+## Persistent stream cache
+
+Caching is enabled by default. Configure these fields on the provider:
+
+- **Cache streamed tracks** controls read-through caching.
+- **Cache directory** defaults to `/data/ytmusic-cache`. Mount this path on
+  persistent storage if `/data` is not already persistent in your deployment.
+
+The first play is forward-only while one upstream response is being copied.
+After it completes, Music Assistant receives a `LOCAL_FILE` stream and normal
+seeking is restored. Trimmed `@start-end` items keep using the direct HTTP path
+and are not cached because the player intentionally stops before the upstream
+file is complete.
+
+Cache names are SHA-256 hashes of YouTube video IDs. Temporary files end in
+`.part`; they are never treated as cache hits. Cache eviction is intentionally
+operator-managed in this first version so the provider never silently deletes
+media from limited-bandwidth installations.
 
 ### Adding an arbitrary YouTube link
 
@@ -338,13 +371,18 @@ Contributions are welcome. Please [open an issue](https://github.com/sproft/musi
 
 This project is fully open-source (FOSS), created purely for educational purposes and personal use. **It is not sold, monetized, or distributed commercially in any way.** There are no advertisements, no premium tiers, no subscriptions, and no financial intent behind it whatsoever. Any form of commercial use is explicitly prohibited.
 
-### 2. A Thin Client, Not a Piracy Tool
+### 2. Personal Local Cache
 
-This provider acts strictly as a thin client that queries publicly accessible YouTube and YouTube Music APIs and passes the resulting stream URLs to Music Assistant for local playback, the same way a web browser with an ad-blocking extension would render the same content. It does not circumvent DRM, does not download or cache media to disk, and does not redistribute any audio or video content.
+This provider queries YouTube and YouTube Music APIs for personal playback. When
+caching is enabled, it stores completed streams on storage controlled by the
+user. It does not circumvent DRM or provide any mechanism for redistributing
+cached media.
 
 ### 3. No Hosting of Copyrighted Material
 
-This project does not host, upload, store, or redistribute any audio, video, or copyrighted media. All content accessed through this provider remains stored exclusively on Google's / YouTube's servers and is the property of the respective copyright holders. This project merely resolves publicly accessible stream URLs for personal, local playback.
+This project does not host or redistribute audio or video. A user who enables
+caching is responsible for the media retained on their own system and for
+ensuring that retention is lawful in their jurisdiction.
 
 ### 4. Support the Artists You Listen To
 
@@ -361,7 +399,10 @@ This provider interacts with YouTube's internal (unofficial) APIs without a prem
 
 ### 6. User Responsibility
 
-The software is provided **"AS IS"**, without warranty of any kind. Users are solely responsible for ensuring their use of this project complies with their local laws and the Terms of Service of any platforms they access through it. Because no media files are hosted by this project, DMCA takedown requests for audio or video content cannot be processed here. Such requests should be directed to Google / YouTube directly.
+The software is provided **"AS IS"**, without warranty of any kind. Users are
+solely responsible for ensuring their use of this project, including local
+caching, complies with their local laws and the Terms of Service of any
+platforms they access.
 
 ---
 

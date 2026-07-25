@@ -14,6 +14,7 @@ apps like SimpMusic work. This may break if YouTube changes their API.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import logging
 import os
@@ -106,8 +107,11 @@ CONF_COOKIE = "cookie_header"
 CONF_BRAND_ACCOUNT = "brand_account"
 CONF_AUTH_USER = "auth_user"
 CONF_PREFER_AUDIO_QUALITY = "prefer_audio_quality"
+CONF_CACHE_ENABLED = "cache_enabled"
+CONF_CACHE_DIRECTORY = "cache_directory"
 AUTH_TYPE_NONE = "none"
 AUTH_TYPE_COOKIE = "cookie"
+DEFAULT_CACHE_DIRECTORY = "/data/ytmusic-cache"
 
 # Releases before multi-instance support wrote the browser auth headers to this
 # fixed path inside the MA container and handed ytmusicapi the filename. Auth is
@@ -322,7 +326,27 @@ async def get_config_entries(
             "free account is Opus at around 160 kbps. Disable only if a player in your setup "
             "cannot handle Opus: that restricts playback to AAC, and the sole AAC stream a "
             "free account is offered is 48 kbps, which is audibly worse. Leave enabled unless "
-            "you have a specific reason not to.",
+                "you have a specific reason not to.",
+        ),
+        ConfigEntry(
+            key=CONF_CACHE_ENABLED,
+            type=ConfigEntryType.BOOLEAN,
+            label="Cache streamed tracks",
+            default_value=True,
+            required=False,
+            description="Save each complete, untrimmed YouTube Music stream while it plays. "
+            "Later plays use the local copy and consume no YouTube bandwidth.",
+        ),
+        ConfigEntry(
+            key=CONF_CACHE_DIRECTORY,
+            type=ConfigEntryType.STRING,
+            label="Cache directory",
+            default_value=DEFAULT_CACHE_DIRECTORY,
+            required=False,
+            depends_on=CONF_CACHE_ENABLED,
+            depends_on_value=[True],
+            description="Writable persistent path for provider-owned audio files. Use a path "
+            "on storage that survives Music Assistant restarts.",
         ),
     )
 
@@ -335,6 +359,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
     _prefer_quality: bool = True
     _authenticated: bool = False
     _auth_lapse_warned: bool = False
+    _cache_enabled: bool = True
+    _cache_directory: str = DEFAULT_CACHE_DIRECTORY
+    _cache_writers: set[str]
     # Per-category flag: True once we've seen a non-empty sync. Used to tell a
     # genuinely empty library apart from a partial-auth HTTP 200 response that
     # ytmusicapi unwraps to []. See issue #10.
@@ -353,6 +380,13 @@ class YoutubeMusicFreeProvider(MusicProvider):
         # False and pin every instance to the high-quality selector.
         prefer_quality = self.config.get_value(CONF_PREFER_AUDIO_QUALITY)
         self._prefer_quality = True if prefer_quality is None else bool(prefer_quality)
+        cache_enabled = self.config.get_value(CONF_CACHE_ENABLED)
+        self._cache_enabled = True if cache_enabled is None else bool(cache_enabled)
+        configured_cache_directory = str(
+            self.config.get_value(CONF_CACHE_DIRECTORY) or DEFAULT_CACHE_DIRECTORY
+        )
+        self._cache_directory = os.path.abspath(configured_cache_directory)
+        self._cache_writers = set()
 
         auth_type = self.config.get_value(CONF_AUTH_TYPE) or AUTH_TYPE_NONE
         if auth_type == AUTH_TYPE_COOKIE:
@@ -1144,6 +1178,27 @@ class YoutubeMusicFreeProvider(MusicProvider):
         don't play.
         """
         video_id, start, end = _split_track_id(item_id)
+        cached_path = await asyncio.to_thread(self._find_cached_path, video_id)
+        if (
+            self._cache_enabled
+            and start is None
+            and end is None
+            and cached_path is not None
+        ):
+            return StreamDetails(
+                provider=self.instance_id,
+                item_id=item_id,
+                audio_format=AudioFormat(
+                    content_type=ContentType.try_parse(
+                        os.path.splitext(cached_path)[1].lstrip(".")
+                    )
+                ),
+                stream_type=StreamType.LOCAL_FILE,
+                path=cached_path,
+                can_seek=True,
+                allow_seek=True,
+            )
+
         stream_format = await self._get_stream_format(video_id)
         self.logger.debug(
             "Resolved stream format '%s' for track %s", stream_format.get("format"), video_id
@@ -1156,6 +1211,8 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 expiration = int(expire_ts) - int(time.time())
 
         audio_ext = stream_format.get("audio_ext") or stream_format.get("ext", "m4a")
+        safe_audio_ext = re.sub(r"[^a-z0-9]", "", str(audio_ext).lower()) or "audio"
+        cache_path = self._cache_path(video_id, safe_audio_ext)
         content_type = ContentType.try_parse(audio_ext)
         if content_type == ContentType.UNKNOWN:
             # Music Assistant's ContentType knows codecs but not every container:
@@ -1170,11 +1227,21 @@ class YoutubeMusicFreeProvider(MusicProvider):
             audio_format=AudioFormat(
                 content_type=content_type,
             ),
-            stream_type=StreamType.HTTP,
+            stream_type=(
+                StreamType.CUSTOM
+                if self._cache_enabled and start is None and end is None
+                else StreamType.HTTP
+            ),
             path=url,
-            can_seek=True,
-            allow_seek=True,
+            # A first-play cache is a single forward-only transfer. Once complete,
+            # the LOCAL_FILE path above restores accurate seeking.
+            can_seek=not self._cache_enabled or start is not None or end is not None,
+            allow_seek=not self._cache_enabled or start is not None or end is not None,
             expiration=expiration,
+            data={
+                "http_headers": stream_format.get("http_headers") or {},
+                "cache_path": cache_path,
+            },
         )
         if channels := stream_format.get("audio_channels"):
             with suppress(ValueError, TypeError):
@@ -1210,6 +1277,114 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 if end is not None:
                     stream_details.duration = end - (start or 0)
         return stream_details
+
+    async def get_audio_stream(
+        self, streamdetails: StreamDetails, seek_position: int = 0
+    ) -> AsyncGenerator[bytes]:
+        """Tee one complete upstream transfer to Music Assistant and the cache."""
+
+        data = streamdetails.data if isinstance(streamdetails.data, dict) else {}
+        cache_path = str(
+            data.get("cache_path") or self._cache_path(streamdetails.item_id, "audio")
+        )
+        headers = {
+            str(key): str(value)
+            for key, value in (data.get("http_headers") or {}).items()
+        }
+        if seek_position:
+            raise UnplayableMediaError("Seeking is available after the first play is cached")
+        if cache_path in self._cache_writers:
+            # Do not let a second listener corrupt the in-progress file. It still
+            # receives a normal stream, but only the first listener owns the cache.
+            async with self.mass.http_session.get(
+                str(streamdetails.path), headers=headers
+            ) as response:
+                response.raise_for_status()
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    yield chunk
+            return
+
+        partial_path = f"{cache_path}.part"
+        completed = False
+        cache_file = None
+        self._cache_writers.add(cache_path)
+        try:
+            try:
+                await asyncio.to_thread(
+                    os.makedirs,
+                    self._cache_directory,
+                    mode=0o775,
+                    exist_ok=True,
+                )
+            except OSError as err:
+                self.logger.warning(
+                    "Cache directory %s is unavailable; continuing playback without "
+                    "caching: %s",
+                    self._cache_directory,
+                    err,
+                )
+            else:
+                try:
+                    cache_file = open(partial_path, "wb")
+                except OSError as err:
+                    self.logger.warning(
+                        "Unable to open cache file %s; continuing playback without "
+                        "caching: %s",
+                        partial_path,
+                        err,
+                    )
+
+            async with self.mass.http_session.get(
+                str(streamdetails.path), headers=headers
+            ) as response:
+                response.raise_for_status()
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    if cache_file is not None:
+                        cache_file.write(chunk)
+                    yield chunk
+                if cache_file is not None:
+                    cache_file.flush()
+                    os.fsync(cache_file.fileno())
+                    cache_file.close()
+                    cache_file = None
+                    await asyncio.to_thread(os.replace, partial_path, cache_path)
+                    completed = True
+                    self.logger.info(
+                        "Cached YouTube Music track %s at %s",
+                        streamdetails.item_id,
+                        cache_path,
+                    )
+        finally:
+            if cache_file is not None:
+                cache_file.close()
+            self._cache_writers.discard(cache_path)
+            if not completed:
+                with suppress(OSError):
+                    await asyncio.to_thread(os.remove, partial_path)
+
+    def _cache_path(self, item_id: str, extension: str) -> str:
+        """Return an instance-local, path-safe cache filename."""
+
+        video_id, _, _ = _split_track_id(item_id)
+        digest = hashlib.sha256(video_id.encode("utf-8")).hexdigest()
+        return os.path.join(self._cache_directory, f"{digest}.{extension}")
+
+    def _find_cached_path(self, item_id: str) -> str | None:
+        """Find a previously completed cache file without accepting partials."""
+
+        video_id, _, _ = _split_track_id(item_id)
+        digest = hashlib.sha256(video_id.encode("utf-8")).hexdigest()
+        prefix = f"{digest}."
+        try:
+            names = os.listdir(self._cache_directory)
+        except OSError:
+            return None
+        for name in names:
+            if name.startswith(prefix) and not name.endswith(".part"):
+                candidate = os.path.join(self._cache_directory, name)
+                if os.path.isfile(candidate):
+                    return candidate
+        return None
 
     # ------------------------------------------------------------------
     # Library methods (require authentication)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,11 +18,13 @@ from music_assistant_models.enums import (
     ImageType,
     MediaType,
     ProviderFeature,
+    StreamType,
 )
 from music_assistant_models.errors import (
     InvalidDataError,
     MediaNotFoundError,
 )
+from music_assistant_models.streamdetails import StreamDetails
 
 import ytmusic_free as ytm
 
@@ -939,10 +942,114 @@ def test_get_config_entries_returns_expected_keys():
         ytm.CONF_BRAND_ACCOUNT,
         ytm.CONF_AUTH_USER,
         ytm.CONF_PREFER_AUDIO_QUALITY,
+        ytm.CONF_CACHE_ENABLED,
+        ytm.CONF_CACHE_DIRECTORY,
     ]
     cookie_entry = next(e for e in entries if e.key == ytm.CONF_COOKIE)
     assert cookie_entry.depends_on == ytm.CONF_AUTH_TYPE
     assert cookie_entry.depends_on_value == [ytm.AUTH_TYPE_COOKIE]
+
+
+def test_completed_stream_is_cached_and_reused(provider, tmp_path):
+    """The first play is a single upstream transfer; the next is local."""
+
+    class Content:
+        async def iter_chunked(self, _size):
+            yield b"first "
+            yield b"play"
+
+    class Response:
+        content = Content()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+    class Session:
+        calls = 0
+
+        def get(self, _url, headers=None):
+            self.calls += 1
+            return Response()
+
+    session = Session()
+    provider.mass = SimpleNamespace(http_session=session)
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+    provider._cache_writers = set()
+
+    async def stream_once():
+        details = await provider.get_stream_details("dQw4w9WgXcQ", MediaType.TRACK)
+        assert details.stream_type == StreamType.CUSTOM
+        assert details.data["cache_path"].endswith(".m4a")
+        chunks = [chunk async for chunk in provider.get_audio_stream(details)]
+        return b"".join(chunks)
+
+    async def stream_format(_item_id):
+        return {
+            "url": "https://stream.example/audio",
+            "ext": "m4a",
+            "audio_ext": "m4a",
+        }
+
+    provider._get_stream_format = stream_format
+    assert asyncio.run(stream_once()) == b"first play"
+    assert session.calls == 1
+
+    cached = asyncio.run(provider.get_stream_details("dQw4w9WgXcQ", MediaType.TRACK))
+    assert cached.stream_type == StreamType.LOCAL_FILE
+    assert cached.path.endswith(".m4a")
+    assert open(cached.path, "rb").read() == b"first play"
+
+
+def test_interrupted_stream_does_not_publish_partial_cache(provider, tmp_path):
+    """A stopped first play leaves no file that could be mistaken for a hit."""
+
+    class Content:
+        async def iter_chunked(self, _size):
+            yield b"partial"
+            yield b"unreachable"
+
+    class Response:
+        content = Content()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+    class Session:
+        def get(self, _url, headers=None):
+            return Response()
+
+    provider.mass = SimpleNamespace(http_session=Session())
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+    provider._cache_writers = set()
+
+    async def interrupt():
+        details = StreamDetails(
+            provider=provider.instance_id,
+            item_id="dQw4w9WgXcQ",
+            stream_type=StreamType.CUSTOM,
+            path="https://stream.example/audio",
+            data={"cache_path": str(tmp_path / "track.m4a")},
+        )
+        stream = provider.get_audio_stream(details)
+        assert await anext(stream) == b"partial"
+        await stream.aclose()
+
+    asyncio.run(interrupt())
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_auth_user_entry_is_cookie_only_and_defaults_to_zero():
