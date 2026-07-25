@@ -120,6 +120,13 @@ fi
 # with "sh: bad option" (issue #35). Guard the fix against regressing.
 src="$(cat "$SCRIPT")"
 assert_contains "re-run hints use the sh -s -- separator" "sh -s --" "$src"
+# These are intentionally literal snippets from the installer source.
+# shellcheck disable=SC2016
+assert_contains "installer defines the retired provider path" \
+    'RETIRED_PROVIDER_DIR="${PROVIDER_DIR}_free"' "$src"
+# shellcheck disable=SC2016
+assert_contains "installer removes the retired provider path" \
+    '"$DST_DIR/$RETIRED_PROVIDER_DIR"' "$src"
 case "$src" in
     *"then re-run with --ma-id ID"*) fail "no bare 're-run with --ma-id ID' hint remains" ;;
     *) pass "no bare 're-run with --ma-id ID' hint remains" ;;

@@ -954,6 +954,7 @@ def test_get_config_entries_returns_expected_keys():
         ytm.CONF_PREFETCH_PLAYLISTS,
         ytm.CONF_PREFETCH_INTERVAL,
         ytm.CONF_PREFETCH_MAX_TRACKS,
+        ytm.CONF_PREFETCH_PARALLEL_DOWNLOADS,
         ytm.CONF_PREFETCH_MAX_CACHE_GB,
         ytm.CONF_PREFETCH_PAUSE_PLAYBACK,
         ytm.CONF_PREFETCH_REQUEST_DELAY,
@@ -1093,6 +1094,51 @@ def test_prefetch_downloads_library_tracks_with_native_progress(provider, tmp_pa
     )
 
 
+def test_prefetch_downloads_tracks_concurrently_when_configured(provider, tmp_path):
+    """The concurrency setting bounds simultaneous yt-dlp track downloads."""
+
+    values = {
+        ytm.CONF_PREFETCH_MAX_TRACKS: 3,
+        ytm.CONF_PREFETCH_PARALLEL_DOWNLOADS: 3,
+        ytm.CONF_PREFETCH_MAX_CACHE_GB: 50,
+        ytm.CONF_PREFETCH_PAUSE_PLAYBACK: False,
+        ytm.CONF_PREFETCH_REQUEST_DELAY: 0,
+    }
+    active = 0
+    maximum_active = 0
+    started = 0
+    all_started = asyncio.Event()
+
+    async def prefetch_candidates(_limit):
+        return ["first-video", "second-video", "third-video"]
+
+    async def prefetch_track(_video_id, *_args):
+        nonlocal active, maximum_active, started
+        active += 1
+        started += 1
+        maximum_active = max(maximum_active, active)
+        if started == 3:
+            all_started.set()
+        await asyncio.wait_for(all_started.wait(), timeout=1)
+        active -= 1
+        return ("downloaded", 1024, 256)
+
+    provider.mass = SimpleNamespace(
+        players=[],
+        tasks=SimpleNamespace(update_current_task_progress=lambda *_args: None),
+    )
+    provider.config = SimpleNamespace(get_value=values.get)
+    provider._authenticated = True
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+    provider._prefetch_candidates = prefetch_candidates
+    provider._prefetch_track = prefetch_track
+
+    asyncio.run(provider._run_cache_prefetch())
+
+    assert maximum_active == 3
+
+
 def test_prefetch_enqueues_durable_catalog_candidates(provider, tmp_path):
     """Inventory enumeration queues work without leasing the full batch."""
 
@@ -1183,8 +1229,8 @@ def test_requested_cache_miss_receives_demand_priority(provider):
     assert provider._cache_catalog.calls == [(["requested-video"], 0)]
 
 
-def test_catalog_prefetch_claims_only_one_job_at_a_time(provider, tmp_path):
-    """Sequential claims leave later jobs eligible for demand reprioritization."""
+def test_catalog_prefetch_claims_only_one_job_at_a_time_by_default(provider, tmp_path):
+    """Default concurrency leaves later jobs eligible for demand reprioritization."""
 
     from ytmusic.catalog import CacheJob
 
@@ -1656,6 +1702,16 @@ def test_auth_user_entry_is_cookie_only_and_defaults_to_zero():
     assert entry.default_value == 0
     assert entry.depends_on == ytm.CONF_AUTH_TYPE
     assert entry.depends_on_value == [ytm.AUTH_TYPE_COOKIE]
+
+
+def test_parallel_prefetch_entry_defaults_to_one():
+    entries = asyncio.run(ytm.get_config_entries(mass=None))
+    entry = next(
+        e for e in entries if e.key == ytm.CONF_PREFETCH_PARALLEL_DOWNLOADS
+    )
+    assert entry.default_value == 1
+    assert entry.depends_on == ytm.CONF_PREFETCH_ENABLED
+    assert entry.depends_on_value == [True]
 
 
 # ---------------------------------------------------------------------------

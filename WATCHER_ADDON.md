@@ -27,6 +27,7 @@ Optionally, the watcher can also keep the provider **up to date**: enable `auto_
 │   └── en.yaml          # friendly names/descriptions for the options below
 └── ytmusic/
     ├── __init__.py
+    ├── catalog.py
     └── manifest.json
 ```
 
@@ -131,6 +132,11 @@ echo "[$(date)] Docker OK"
 install_provider() {
     echo "[$(date)] Installing ytmusic provider..."
     sleep 3
+    retired_provider="ytmusic""_free"
+    docker exec "$MA" rm -rf \
+        "$DST/ytmusic" \
+        "$DST/$retired_provider" \
+        2>/dev/null || true
     docker cp "$SRC" "$MA:$DST/" && echo "[$(date)] Copied OK" || { echo "[$(date)] ERROR: cp failed"; return 1; }
     docker restart "$MA" && echo "[$(date)] MA restarted" || echo "[$(date)] ERROR: restart failed"
 }
@@ -184,11 +190,25 @@ The script is POSIX `sh` (works on HAOS BusyBox `ash`), uses `curl + tar` instea
 
 Common flags:
 - `--force`: overwrite an existing install without prompting
-- `--ref TAG`: pin to a release tag instead of `master`
+- `--ref REF`: use a branch, release tag, or commit instead of `master`
 - `--ma-id ID` / `--python-version pythonX.Y`: override auto-detection
 - `--addons-dir DIR`: skip path auto-detection (useful for non-standard installs)
 
 Run `sh install_watcher_addon.sh --help` to see all options.
+
+### Upgrading across the provider-domain rename
+
+Re-run the watcher installer with `--force`, then rebuild and restart the local
+add-on. The generated watcher removes the retired provider package from each
+Music Assistant container before installing `ytmusic`, preventing duplicate
+provider modules.
+
+Music Assistant can retain the earlier provider configuration as an unavailable
+source because its stored domain differs. Remove that unavailable source and
+add **YouTube Music** again with the same cookie and cache directory. Existing
+completed cache files remain reusable. See
+[the main migration notes](README.md#upgrading-across-the-provider-domain-rename)
+for the account-catalog behavior.
 
 > **Passing flags through `curl | sh`:** if you re-run the one-liner with a flag, use `sh -s --` as a separator so the flag goes to the script and not to `sh` itself:
 >
@@ -291,7 +311,9 @@ Set these in the add-on's **Configuration** tab (or `options` in `config.yaml`):
 | `auto_update` | bool | `false` | Off by default (opt-in). When on, the watcher periodically checks GitHub for a newer provider and reinstalls it. Note it then runs branch-head code inside MA unattended. Leave off to pin to the version baked into the image. |
 | `update_interval_hours` | int (hours) | `24` | How often to check. `24` = daily, `168` = weekly, `1` = hourly. Clamped to a minimum of `1` at runtime; invalid values fall back to the default. |
 
-Auto-update follows the **branch head** given by `--ref` (default `master`); it does not resolve tags or commit SHAs.
+`--ref` accepts a branch, release tag, or commit. The default `master` moves
+with the branch; a tag or commit remains pinned, so periodic checks are
+unchanged until the watcher is reinstalled with another ref.
 
 ### How it works
 

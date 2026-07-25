@@ -239,6 +239,8 @@ else
     assert_contains "run.sh has misconfig diagnostic function" "warn_if_ma_misconfigured" "$runsh"
     assert_contains "run.sh references MISSING_GRACE_SECONDS" "MISSING_GRACE_SECONDS" "$runsh"
     assert_contains "run.sh diagnostic mentions --ma-id remedy" "--ma-id" "$runsh"
+    assert_contains "run.sh removes the retired provider path" \
+        'retired_provider="ytmusic""_free"' "$runsh"
 
     if bash -n "$ADDON/run.sh" 2>/dev/null; then
         pass "generated run.sh passes bash -n"

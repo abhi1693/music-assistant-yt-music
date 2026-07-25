@@ -2,8 +2,8 @@
 
 An experimental Music Assistant music provider for YouTube and YouTube Music.
 It supports anonymous catalogue playback, optional account-backed library
-features, and a persistent read-through audio cache for bandwidth-constrained
-installations.
+features, and persistent local playback of completed background downloads for
+bandwidth-constrained installations.
 
 This is an unofficial community integration. It is not affiliated with Google,
 YouTube, YouTube Music, or the Music Assistant project.
@@ -20,7 +20,7 @@ YouTube, YouTube Music, or the Music Assistant project.
 - Multiple Music Assistant provider instances for separate accounts
 - Direct resolution of pasted YouTube and YouTube Music links
 - Optional start/end trimming for individual videos
-- Persistent, read-through caching of completed streams
+- Persistent local playback of atomically completed background downloads
 - Standalone Docker images for the latest and beta Music Assistant channels
 
 Podcast support is not implemented.
@@ -34,11 +34,12 @@ Podcast support is not implemented.
 | Music Assistant | Library management, queueing, decoding, normalization, and players |
 | Persistent cache | Serving atomically published background downloads locally |
 
-An uncached foreground play starts immediately from YouTube. Independently, the
-native background task uses yt-dlp to download into persistent local staging,
-where interrupted transfers can resume. A complete stage is copied, flushed,
-and atomically promoted on the cache filesystem. Interrupted transfers and
-publication copies are never accepted as cache hits.
+An uncached foreground play starts immediately from YouTube and never writes a
+cache file. Independently, the authenticated native background task uses yt-dlp
+to download into persistent local staging, where interrupted transfers can
+resume. A complete stage is copied, flushed, and atomically promoted on the
+cache filesystem. Interrupted transfers and publication copies are never
+accepted as cache hits.
 
 Each background claim performs one authenticated extraction and passes that
 already-resolved format directly to yt-dlp. The provider loads its configured
@@ -147,7 +148,8 @@ The installer:
 
 1. Detects the Music Assistant container.
 2. Detects its active Python version and configuration path.
-3. Stages the provider under the Music Assistant custom-components path.
+3. Stages a persistent recovery copy under the Music Assistant
+   custom-components path.
 4. Copies it into the running container.
 5. Restarts Music Assistant unless instructed otherwise.
 
@@ -201,6 +203,21 @@ After installation:
 The provider can be renamed to **YouTube Music** or any other local display
 name without changing its internal `ytmusic` domain.
 
+### Upgrading across the provider-domain rename
+
+The current package directory and provider domain are both `ytmusic`. The
+installers remove the retired package directory before copying this one so
+Music Assistant cannot load two implementations.
+
+Music Assistant may retain the previous provider configuration as an
+unavailable source because its stored domain is different. Remove that
+unavailable entry, add **YouTube Music**, and reuse the same cookie and cache
+directory. Completed cache files are content-addressed and are discovered again
+from disk; the account mirror and durable queue rebuild under the new provider
+instance. The home-lab deployment in this repository's companion GitOps project
+performs its PostgreSQL, SQLite, settings, and retained-path migration
+automatically before Music Assistant starts.
+
 ## Configuration
 
 | Setting | Default | Purpose |
@@ -210,16 +227,17 @@ name without changing its internal `ytmusic` domain.
 | Brand account ID | Empty | Selects a YouTube brand account |
 | Account index | `0` | Selects an account from a multi-account Google session |
 | Prefer highest audio quality | Enabled | Selects yt-dlp's highest-ranked accessible audio format |
-| Cache streamed tracks | Enabled | Reuses completed local files and enables background prefetch |
+| Enable persistent local cache | Enabled | Reuses completed background downloads; foreground playback never writes cache files |
 | Cache directory | `/data/ytmusic-cache` | Writable persistent cache location |
 | Cache staging directory | `/data/ytmusic-cache-staging` | Persistent local workspace for resumable yt-dlp downloads |
-| PostgreSQL cache catalog DSN | Empty | Enables durable queue, leases, retries, and cache metadata |
-| Mirror complete account | Enabled | Persists supported account collections and ordered relationships in PostgreSQL |
+| PostgreSQL catalog DSN | Empty | Enables the account mirror plus durable queue, leases, retries, and cache metadata |
+| Mirror complete account | Enabled | Persists supported account collections and ordered relationships when PostgreSQL is configured |
 | Account mirror interval | 6 hours | Refresh cadence for the account snapshot |
 | Prefetch library to cache | Disabled | Registers an app-native scheduled cache task |
 | Include playlists in prefetch | Disabled | Adds authenticated library playlists to the prefetch scope |
 | Prefetch interval | 6 hours | Recurring Music Assistant task schedule |
-| Maximum tracks per run | 100 | Bounds work performed by one task run |
+| Maximum tracks per run | 100 | Bounds download and quality-upgrade jobs processed by one task run |
+| Parallel prefetch downloads | `1` | Simultaneous yt-dlp track downloads; configurable from 1 to 8 |
 | Maximum cache size | 50 GB | Stops prefetch without evicting completed files; `0` disables the limit |
 | Pause prefetch while players are active | Disabled | Optional bandwidth protection; downloads continue during playback by default |
 | Delay between prefetch requests | 15 seconds | Protects the authenticated session from bulk-request bot challenges |
@@ -248,9 +266,12 @@ browser cookie enables:
 7. Paste it into the provider's **Cookie header** field.
 8. Close the private window without explicitly signing out.
 
-The cookie should include `__Secure-3PAPISID`, `SID`, `HSID`, and `SSID`.
-Treat it like a password. Never put it in an issue, log excerpt, image, or
-unencrypted configuration file.
+The cookie must include `__Secure-3PAPISID`. A complete capture should also
+include `__Secure-1PSID`, `__Secure-3PSID`, and `SAPISID`; the provider warns
+when those recommended values are absent because partial cookies can validate
+initially and fail on later library calls. Treat the complete header like a
+password. Never put it in an issue, log excerpt, image, or unencrypted
+configuration file.
 
 Music Assistant stores the configured secret. The provider builds authentication
 headers in memory and does not keep a separate plaintext cookie file. Releases
@@ -312,8 +333,9 @@ published.
 
 ## Persistent stream cache
 
-Caching is enabled by default. The cache directory must be writable and backed
-by persistent storage if it should survive container replacement.
+Local-cache lookup is enabled by default. Authenticated background prefetch must
+also be enabled to populate new files. The cache directory must be writable and
+backed by persistent storage if it should survive container replacement.
 
 ### Lifecycle
 
@@ -392,13 +414,23 @@ Each run:
    requeues stale rows.
 4. Schedules cooled-down quality checks for cached files below the configured
    bitrate target.
-5. Claims one PostgreSQL job at a time so a newly requested cache miss can
-   move ahead of untouched bulk-library work.
-6. Downloads or upgrades at most the configured number of tracks, sequentially.
-7. Uses yt-dlp's resumable, chunked downloader, the provider's audio-quality
+5. Claims each PostgreSQL job individually, leasing no more than the configured
+   parallel-download limit before starting a batch, so newly requested misses
+   can still move ahead of untouched bulk-library work.
+6. Downloads or upgrades at most the configured number of tracks, using the
+   configured parallel-download limit.
+7. Staggers starts inside each concurrent batch by the configured request delay
+   and uses yt-dlp's resumable, chunked downloader, the provider's audio-quality
    selector, local staging, and atomic cache publication.
 8. Stops at the configured cache-size ceiling without deleting existing files.
 9. Pauses when foreground playback is active when that protection is enabled.
+
+Parallel downloads default to `1` and are capped at `8`. A value above `1`
+creates separate yt-dlp track downloads; it does not split one audio file into
+several independent cache entries. Higher values increase bandwidth and
+YouTube request pressure. Because already-started jobs finish atomically, a
+concurrent batch can exceed the cache-size ceiling by at most the other
+in-flight files in that batch.
 
 Without a catalog DSN, completed cache files remain the durable task state and
 the next execution rescans the library. With a PostgreSQL DSN, the provider
@@ -414,11 +446,13 @@ stream immediately and does not wait for the background download.
 The PostgreSQL integration is fail-open: connection or query failures disable
 durable coordination for that run but do not prevent normal remote playback or
 local-file cache hits. Use a dedicated database and role. The provider creates
-and migrates only its `ytmusic_cache_*` tables.
+and migrates its `ytmusic_cache_*` queue/cache tables and
+`ytmusic_account_*` mirror tables.
 
 Prefetch requires a Music Assistant release that exposes the native Background
 Tasks controller. Older releases continue to support normal playback and
-read-through caching, but log a warning and do not register the scheduled task.
+local playback of already completed cache files, but log a warning and do not
+register the scheduled task.
 
 ## Supported features
 
@@ -428,7 +462,8 @@ read-through caching, but log a warning and do not register the scheduled task.
 | Track, album, artist, and playlist playback | Yes | Yes |
 | Pasted YouTube links | Yes | Yes |
 | Video trimming | Yes | Yes |
-| Persistent stream cache | Yes | Yes |
+| Play completed local cache files | Yes | Yes |
+| Populate cache with native library prefetch | No | Yes |
 | Artist albums and top tracks | Yes | Yes |
 | Similar tracks and song radio | Yes | Yes |
 | Multiple provider instances | Yes | Yes |
@@ -483,13 +518,16 @@ direct stream and are not cached.
 - Update to the latest provider release and yt-dlp dependency.
 - Some restricted or removed tracks cannot be made playable by this provider.
 
-### Playback creates another `.part` beside a completed file
+### A `.part` appears beside a completed file
 
-- Upgrade to `v0.2.2` or later. Earlier releases could trust preloaded stream
-  details and begin another download after the first request had already
-  published the cache file.
-- Confirm the completed and partial filenames have the same hash and extension.
-- Confirm only one Music Assistant deployment writes to that cache directory.
+- Foreground playback never writes the cache. A destination `.part` is created
+  only while the background task copies a completed local stage to the cache
+  filesystem, including during a quality upgrade.
+- The prior completed file remains playable until the copy is flushed and
+  atomically renamed. The `.part` should then disappear.
+- If it remains after the background task ends, inspect the prefetch task and
+  Music Assistant logs for an interrupted pod, NFS write, flush, or rename
+  failure. Confirm only one Music Assistant deployment writes to the directory.
 
 ### Confirming that playback uses the persistent cache
 
@@ -507,12 +545,13 @@ direct stream and are not cached.
   `LOCAL_FILE` response does not currently persist the original bitrate as
   metadata; it is not proof of an upstream request.
 
-### A `.part` remains after playback
+### A staging `.part` survives a restart
 
-- A growing file indicates an active writer.
-- A zero-byte or stale file can be left by a hard process or host failure.
-- Do not remove a growing `.part` while playback is active.
-- Completed files never use the `.part` suffix.
+- This is expected for an interrupted yt-dlp transfer under the configured
+  staging directory; the next background run resumes it.
+- Destination `.part` files in the cache directory are publication copies, are
+  never cache hits, and are removed after a handled publication failure.
+- Completed cache files never use the `.part` suffix.
 
 ### Audio is lower quality than expected
 
@@ -545,6 +584,7 @@ The provider installs these packages through Music Assistant:
 
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp)
 - [`ytmusicapi`](https://github.com/sigma67/ytmusicapi)
+- [`asyncpg`](https://magicstack.github.io/asyncpg/)
 
 First startup requires outbound package access and a writable Python
 environment. Container deployments may prefer the prebuilt image or a
@@ -555,8 +595,8 @@ declaratively prepared persistent virtual environment.
 Run the Python suite:
 
 ```sh
-uv run --with pytest --with 'yt-dlp>=2024.1.0' \
-  python -m pytest -q
+uv run --with-requirements tests/python/requirements.txt \
+  python -m pytest tests/python -q
 ```
 
 Run the installer suites:
@@ -604,5 +644,5 @@ Notable upstream contributors include:
 - [@bsny](https://github.com/bsny) — artist parsing and fork-aware installers
 
 This fork is maintained by [@abhi1693](https://github.com/abhi1693), with
-persistent read-through caching, home-lab deployment support, and subsequent
+persistent background caching, home-lab deployment support, and subsequent
 fixes contributed with the help of the wider open-source community.

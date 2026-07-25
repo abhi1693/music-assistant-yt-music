@@ -12,7 +12,7 @@
 # What it does:
 #   1. Downloads ytmusic/ from the repository at the requested ref.
 #   2. Stages it at /config/custom_components/mass/providers/ytmusic
-#      (persistent location used by the watcher add-on).
+#      as a persistent recovery copy.
 #   3. Copies it into the live MA container at
 #      /app/venv/lib/<pythonX.Y>/site-packages/music_assistant/providers/.
 #   4. Restarts the MA container so it picks up the new files.
@@ -25,6 +25,7 @@ set -eu
 REPO_OWNER="abhi1693"
 REPO_NAME="music-assistant-yt-music"
 PROVIDER_DIR="ytmusic"
+RETIRED_PROVIDER_DIR="${PROVIDER_DIR}_free"
 
 REF="master"
 FORCE=0
@@ -169,7 +170,7 @@ fi
 TMPDIR="$(mktemp -d 2>/dev/null || mktemp -d -t mip)"
 trap 'rm -rf "$TMPDIR"' EXIT INT TERM
 
-TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REF"
+TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/$REF"
 log "Downloading $TARBALL_URL"
 curl -fsSL "$TARBALL_URL" -o "$TMPDIR/repo.tar.gz" \
     || die "download failed (check --ref or your network)"
@@ -188,6 +189,7 @@ SRC_ROOT="$TMPDIR/$REPO_NAME-$SAFE_REF"
 if [ "$NO_STAGE" -ne 1 ]; then
     STAGE_DIR="$CONFIG_DIR/custom_components/mass/providers"
     STAGE_TARGET="$STAGE_DIR/$PROVIDER_DIR"
+    RETIRED_STAGE_TARGET="$STAGE_DIR/$RETIRED_PROVIDER_DIR"
 
     if [ -e "$STAGE_TARGET" ]; then
         if [ "$FORCE" -ne 1 ]; then
@@ -204,6 +206,10 @@ if [ "$NO_STAGE" -ne 1 ]; then
 
     log "Staging to $STAGE_TARGET"
     mkdir -p "$STAGE_DIR"
+    if [ -e "$RETIRED_STAGE_TARGET" ]; then
+        log "Removing retired provider path $RETIRED_STAGE_TARGET"
+        rm -rf "$RETIRED_STAGE_TARGET"
+    fi
     cp -R "$SRC_ROOT/$PROVIDER_DIR" "$STAGE_TARGET"
 fi
 
@@ -211,7 +217,10 @@ fi
 
 log "Copying provider into $MA_ID:$DST_DIR/"
 # Remove any stale copy inside the container so docker cp doesn't merge into it.
-docker exec "$MA_ID" rm -rf "$DST_DIR/$PROVIDER_DIR" 2>/dev/null || true
+docker exec "$MA_ID" rm -rf \
+    "$DST_DIR/$PROVIDER_DIR" \
+    "$DST_DIR/$RETIRED_PROVIDER_DIR" \
+    2>/dev/null || true
 
 docker cp "$SRC_ROOT/$PROVIDER_DIR" "$MA_ID:$DST_DIR/" \
     || die "docker cp failed. Is the MA container running?"

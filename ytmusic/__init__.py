@@ -126,6 +126,7 @@ CONF_PREFETCH_ENABLED = "prefetch_enabled"
 CONF_PREFETCH_PLAYLISTS = "prefetch_playlists"
 CONF_PREFETCH_INTERVAL = "prefetch_interval_hours"
 CONF_PREFETCH_MAX_TRACKS = "prefetch_max_tracks"
+CONF_PREFETCH_PARALLEL_DOWNLOADS = "prefetch_parallel_downloads"
 CONF_PREFETCH_MAX_CACHE_GB = "prefetch_max_cache_gb"
 CONF_PREFETCH_PAUSE_PLAYBACK = "prefetch_pause_playback"
 CONF_PREFETCH_REQUEST_DELAY = "prefetch_request_delay_seconds"
@@ -357,16 +358,16 @@ async def get_config_entries(
             "free account is Opus at around 160 kbps. Disable only if a player in your setup "
             "cannot handle Opus: that restricts playback to AAC, and the sole AAC stream a "
             "free account is offered is 48 kbps, which is audibly worse. Leave enabled unless "
-                "you have a specific reason not to.",
+            "you have a specific reason not to.",
         ),
         ConfigEntry(
             key=CONF_CACHE_ENABLED,
             type=ConfigEntryType.BOOLEAN,
-            label="Cache streamed tracks",
+            label="Enable persistent local cache",
             default_value=True,
             required=False,
-            description="Save each complete, untrimmed YouTube Music stream while it plays. "
-            "Later plays use the local copy and consume no YouTube bandwidth.",
+            description="Play completed provider cache files locally. Foreground playback "
+            "does not write cache files; authenticated background prefetch populates them.",
         ),
         ConfigEntry(
             key=CONF_CACHE_DIRECTORY,
@@ -393,13 +394,14 @@ async def get_config_entries(
         ConfigEntry(
             key=CONF_CACHE_CATALOG_DSN,
             type=ConfigEntryType.SECURE_STRING,
-            label="PostgreSQL cache catalog DSN (optional)",
+            label="PostgreSQL catalog DSN (optional)",
             default_value="",
             required=False,
             depends_on=CONF_CACHE_ENABLED,
             depends_on_value=[True],
-            description="Optional postgresql:// DSN for durable prefetch state, retries, "
-            "leases, and cache metadata. Playback remains available if PostgreSQL is down.",
+            description="Optional postgresql:// DSN for the account mirror and durable "
+            "prefetch state, retries, leases, and cache metadata. Playback remains "
+            "available if PostgreSQL is down.",
         ),
         ConfigEntry(
             key=CONF_ACCOUNT_SYNC_ENABLED,
@@ -461,7 +463,20 @@ async def get_config_entries(
             required=False,
             depends_on=CONF_PREFETCH_ENABLED,
             depends_on_value=[True],
-            description="Maximum number of new tracks downloaded by one scheduled run.",
+            description="Maximum number of download or quality-upgrade jobs processed by "
+            "one scheduled run.",
+        ),
+        ConfigEntry(
+            key=CONF_PREFETCH_PARALLEL_DOWNLOADS,
+            type=ConfigEntryType.INTEGER,
+            label="Parallel prefetch downloads",
+            default_value=1,
+            required=False,
+            depends_on=CONF_PREFETCH_ENABLED,
+            depends_on_value=[True],
+            description="Number of tracks yt-dlp may download concurrently. Values above "
+            "8 are capped at 8. Higher concurrency uses more bandwidth and increases "
+            "the chance of YouTube challenging the authenticated session.",
         ),
         ConfigEntry(
             key=CONF_PREFETCH_MAX_CACHE_GB,
@@ -2376,128 +2391,197 @@ class YoutubeMusicProvider(MusicProvider):
         request_delay = self._config_nonnegative_int(
             CONF_PREFETCH_REQUEST_DELAY, 15
         )
-        while processed < max_tracks:
-            if self._cache_catalog is not None:
-                claimed = await self._catalog_call("claim", 1)
-                if not claimed:
-                    break
-                job = claimed[0]
-                video_id = job.track_id
-                self._catalog_claim_attempts[video_id] = job.attempt_count
-                quality_upgrade = job.quality_upgrade
-                cached_bitrate = job.cached_bitrate
-            else:
-                if processed >= len(candidates):
-                    break
-                video_id = candidates[processed]
-                quality_upgrade = False
-                cached_bitrate = None
-            processed += 1
-            # A durable catalog may already contain eligible jobs that are not
-            # part of this run's freshly enumerated candidate list. Use the
-            # configured work bound as the denominator in that case; otherwise
-            # a short candidate list followed by older claims can emit >100%.
-            task_total = (
-                max_tracks
-                if self._cache_catalog is not None
-                else min(max_tracks, max(1, len(candidates)))
-            )
-            progress = min(99, int(((processed - 1) / task_total) * 100))
-            self.mass.tasks.update_current_task_progress(
-                progress,
-                f"Caching track {processed}/{task_total}",
-            )
+        parallel_downloads = min(
+            8,
+            self._config_positive_int(
+                CONF_PREFETCH_PARALLEL_DOWNLOADS,
+                1,
+            ),
+        )
+        # A durable catalog may already contain eligible jobs that are not part
+        # of this run's freshly enumerated candidate list. Use the configured
+        # work bound as the denominator in that case; otherwise a short
+        # candidate list followed by older claims can emit progress above 100%.
+        task_total = (
+            max_tracks
+            if self._cache_catalog is not None
+            else min(max_tracks, max(1, len(candidates)))
+        )
+
+        async def download_job(
+            job: tuple[str, bool, int | None],
+            position_in_batch: int,
+            batch_cache_size: int,
+        ) -> tuple[
+            tuple[str, bool, int | None],
+            tuple[str, int, int | None] | None,
+            Exception | None,
+        ]:
+            if request_delay and position_in_batch:
+                await asyncio.sleep(request_delay * position_in_batch)
+            video_id, quality_upgrade, cached_bitrate = job
             try:
-                result, size_delta, selected_bitrate = await self._prefetch_track(
+                outcome = await self._prefetch_track(
                     video_id,
-                    cache_size,
+                    batch_cache_size,
                     cache_limit,
                     pause_during_playback,
                     quality_upgrade,
                     cached_bitrate,
                 )
             except Exception as err:  # noqa: BLE001
-                failed += 1
-                attempt_count = self._catalog_claim_attempts.get(video_id, 1)
-                error_name = type(err).__name__
-                if status := getattr(err, "status", None):
-                    error_name = f"{error_name} HTTP {status}"
-                await self._catalog_call(
-                    "mark_retry", video_id, error_name, attempt_count
+                return (job, None, err)
+            return (job, outcome, None)
+
+        while processed < max_tracks:
+            batch: list[tuple[str, bool, int | None]] = []
+            while (
+                len(batch) < parallel_downloads
+                and processed + len(batch) < max_tracks
+            ):
+                if self._cache_catalog is not None:
+                    claimed = await self._catalog_call("claim", 1)
+                    if not claimed:
+                        break
+                    claimed_job = claimed[0]
+                    video_id = claimed_job.track_id
+                    self._catalog_claim_attempts[video_id] = (
+                        claimed_job.attempt_count
+                    )
+                    batch.append(
+                        (
+                            video_id,
+                            claimed_job.quality_upgrade,
+                            claimed_job.cached_bitrate,
+                        )
+                    )
+                    continue
+                candidate_index = processed + len(batch)
+                if candidate_index >= len(candidates):
+                    break
+                batch.append((candidates[candidate_index], False, None))
+            if not batch:
+                break
+
+            for offset, _job in enumerate(batch):
+                track_number = processed + offset + 1
+                progress = min(
+                    99,
+                    int(((track_number - 1) / task_total) * 100),
                 )
-                self.logger.warning(
-                    "Unable to prefetch YouTube Music track %s: %s",
-                    video_id,
-                    error_name,
+                self.mass.tasks.update_current_task_progress(
+                    progress,
+                    f"Caching track {track_number}/{task_total}",
                 )
-                if self._is_youtube_challenge(err):
+            batch_cache_size = cache_size
+            batch_results = await asyncio.gather(
+                *(
+                    download_job(job, offset, batch_cache_size)
+                    for offset, job in enumerate(batch)
+                )
+            )
+            stop_after_batch = False
+            for job, outcome, err in batch_results:
+                processed += 1
+                video_id, _quality_upgrade, _cached_bitrate = job
+                if err is None:
+                    assert outcome is not None
+                    result, size_delta, selected_bitrate = outcome
+                else:
+                    result = ""
+                    size_delta = 0
+                    selected_bitrate = None
+
+                if err is not None:
+                    failed += 1
+                    attempt_count = self._catalog_claim_attempts.get(video_id, 1)
+                    error_name = type(err).__name__
+                    if status := getattr(err, "status", None):
+                        error_name = f"{error_name} HTTP {status}"
                     await self._catalog_call(
-                        "set_cooldown",
-                        6 * 60 * 60,
-                        "YouTube bot challenge",
+                        "mark_retry", video_id, error_name, attempt_count
                     )
                     self.logger.warning(
-                        "Paused YouTube Music prefetch for 6 hours after YouTube "
-                        "challenged the authenticated browser session"
-                    )
-                    break
-                continue
-            if result in {"downloaded", "upgraded"}:
-                if result == "downloaded":
-                    downloaded += 1
-                else:
-                    upgraded += 1
-                cache_size += size_delta
-                cached_path = self._find_cached_path(video_id)
-                if cached_path is not None:
-                    size_bytes = os.path.getsize(cached_path)
-                    await self._catalog_call(
-                        "mark_cached",
+                        "Unable to prefetch YouTube Music track %s: %s",
                         video_id,
-                        cached_path,
-                        size_bytes,
-                        os.path.splitext(cached_path)[1].lstrip("."),
-                        selected_bitrate,
+                        error_name,
                     )
-            elif result == "current":
-                quality_current += 1
-                await self._catalog_call(
-                    "mark_quality_current",
-                    video_id,
-                    selected_bitrate,
-                )
-            elif result == "skipped":
-                skipped += 1
-                cached_path = self._find_cached_path(video_id)
-                if cached_path is not None:
-                    with suppress(OSError):
+                    if self._is_youtube_challenge(err):
+                        await self._catalog_call(
+                            "set_cooldown",
+                            6 * 60 * 60,
+                            "YouTube bot challenge",
+                        )
+                        self.logger.warning(
+                            "Paused YouTube Music prefetch for 6 hours after YouTube "
+                            "challenged the authenticated browser session"
+                        )
+                        stop_after_batch = True
+                    continue
+
+                if result in {"downloaded", "upgraded"}:
+                    if result == "downloaded":
+                        downloaded += 1
+                    else:
+                        upgraded += 1
+                    cache_size += size_delta
+                    cached_path = self._find_cached_path(video_id)
+                    if cached_path is not None:
                         size_bytes = os.path.getsize(cached_path)
                         await self._catalog_call(
-                            "reconcile_cached",
-                            [
-                                (
-                                    video_id,
-                                    cached_path,
-                                    size_bytes,
-                                    os.path.splitext(cached_path)[1].lstrip("."),
-                                )
-                            ],
+                            "mark_cached",
+                            video_id,
+                            cached_path,
+                            size_bytes,
+                            os.path.splitext(cached_path)[1].lstrip("."),
+                            selected_bitrate,
                         )
-                else:
+                elif result == "current":
+                    quality_current += 1
+                    await self._catalog_call(
+                        "mark_quality_current",
+                        video_id,
+                        selected_bitrate,
+                    )
+                elif result == "skipped":
+                    skipped += 1
+                    cached_path = self._find_cached_path(video_id)
+                    if cached_path is not None:
+                        with suppress(OSError):
+                            size_bytes = os.path.getsize(cached_path)
+                            await self._catalog_call(
+                                "reconcile_cached",
+                                [
+                                    (
+                                        video_id,
+                                        cached_path,
+                                        size_bytes,
+                                        os.path.splitext(cached_path)[1].lstrip(
+                                            "."
+                                        ),
+                                    )
+                                ],
+                            )
+                    else:
+                        await self._catalog_call("release", video_id)
+                elif result == "busy":
                     await self._catalog_call("release", video_id)
-            elif result == "busy":
-                await self._catalog_call("release", video_id)
-            elif result == "paused":
-                await self._catalog_call("release", video_id)
-                self.logger.info(
-                    "Paused YouTube Music prefetch because foreground playback started"
-                )
-                break
-            elif result == "limit":
-                await self._catalog_call("release", video_id)
-                self.logger.info(
-                    "Stopped YouTube Music prefetch at the configured cache-size limit"
-                )
+                elif result == "paused":
+                    await self._catalog_call("release", video_id)
+                    self.logger.info(
+                        "Paused YouTube Music prefetch because foreground "
+                        "playback started"
+                    )
+                    stop_after_batch = True
+                elif result == "limit":
+                    await self._catalog_call("release", video_id)
+                    self.logger.info(
+                        "Stopped YouTube Music prefetch at the configured "
+                        "cache-size limit"
+                    )
+                    stop_after_batch = True
+
+            if stop_after_batch:
                 break
             if request_delay and processed < max_tracks:
                 await asyncio.sleep(request_delay)

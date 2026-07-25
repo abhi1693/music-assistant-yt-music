@@ -52,7 +52,7 @@ Usage: sh install_watcher_addon.sh [options]
 Options:
   --force, -f               Overwrite existing add-on directory without prompting
   --repo-owner OWNER        Repository owner (default: abhi1693)
-  --ref REF                 Branch to download; auto-update follows this branch head (default: master)
+  --ref REF                 Branch, tag, or commit to download (default: master)
   --ma-id ID                Music Assistant container ID (default: auto-detect)
   --python-version VER      MA Python version, e.g. python3.13 (default: auto-detect)
   --addons-dir DIR          Local add-ons directory (default: auto-detect HAOS vs. Supervised)
@@ -190,7 +190,7 @@ fi
 TMPDIR="$(mktemp -d 2>/dev/null || mktemp -d -t maw)"
 trap 'rm -rf "$TMPDIR"' EXIT INT TERM
 
-TARBALL_URL="${YTMUSIC_TARBALL_URL_OVERRIDE:-https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REF}"
+TARBALL_URL="${YTMUSIC_TARBALL_URL_OVERRIDE:-https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/$REF}"
 log "Downloading $TARBALL_URL"
 curl -fsSL "$TARBALL_URL" -o "$TMPDIR/repo.tar.gz" \
     || die "download failed (check --ref or your network)"
@@ -360,7 +360,7 @@ HASHFILE="/data/ytmusic.sha256"
 DST="/app/venv/lib/$PYTHON_VERSION/site-packages/music_assistant/providers"
 # Where auto-update pulls the latest provider from. Baked from the installer's
 # --repo-owner/--ref so a fork self-updates from its own source.
-TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REF"
+TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/$REF"
 # How long to wait for the configured MA container to appear before logging a
 # loud ERROR. Catches the case where the installer's auto-detect fallback
 # baked in a container name that does not exist on this host (issue #11).
@@ -392,7 +392,11 @@ install_provider() {
     # Clear any stale in-place copy so docker cp is a clean replace, not a merge:
     # files deleted upstream would otherwise linger across periodic auto-updates
     # (docker restart keeps the container filesystem). Mirrors install_provider.sh.
-    docker exec "\$MA" rm -rf "\$DST/ytmusic" 2>/dev/null || true
+    retired_provider="ytmusic""_free"
+    docker exec "\$MA" rm -rf \
+        "\$DST/ytmusic" \
+        "\$DST/\$retired_provider" \
+        2>/dev/null || true
     docker cp "\$src" "\$MA:\$DST/" && echo "[\$(date)] Copied OK" || { echo "[\$(date)] ERROR: cp failed"; return 1; }
     docker restart "\$MA" && echo "[\$(date)] MA restarted" || echo "[\$(date)] ERROR: restart failed"
 }
