@@ -201,6 +201,7 @@ name without changing its internal `ytmusic_free` domain.
 | Prefer highest audio quality | Enabled | Selects yt-dlp's highest-ranked accessible audio format |
 | Cache streamed tracks | Enabled | Reuses completed local files and enables background prefetch |
 | Cache directory | `/data/ytmusic-cache` | Writable persistent cache location |
+| PostgreSQL cache catalog DSN | Empty | Enables durable queue, leases, retries, and cache metadata |
 | Prefetch library to cache | Disabled | Registers an app-native scheduled cache task |
 | Include playlists in prefetch | Disabled | Adds authenticated library playlists to the prefetch scope |
 | Prefetch interval | 6 hours | Recurring Music Assistant task schedule |
@@ -354,14 +355,20 @@ Each run:
 2. Optionally enumerates tracks from library playlists.
 3. Skips completed cache entries.
 4. Downloads at most the configured number of new tracks, sequentially.
-5. Uses the same audio-quality selector and atomic cache publication as
-   foreground playback.
+5. Uses the provider's audio-quality selector and atomic cache publication.
 6. Stops at the configured cache-size ceiling without deleting existing files.
 7. Pauses when foreground playback is active when that protection is enabled.
 
-Completed cache files are the durable task state. After a restart or cancelled
-run, the next execution rescans the library and continues with missing tracks;
-there is no second queue database to repair.
+Without a catalog DSN, completed cache files remain the durable task state and
+the next execution rescans the library. With a PostgreSQL DSN, the provider
+also persists pending, downloading, retry, failed, and cached states. Workers
+claim jobs using `FOR UPDATE SKIP LOCKED` and a 15-minute lease. Failures use
+bounded exponential backoff and become terminal after ten attempts.
+
+The PostgreSQL integration is fail-open: connection or query failures disable
+durable coordination for that run but do not prevent normal remote playback or
+local-file cache hits. Use a dedicated database and role. The provider creates
+and migrates only its `ytmusic_cache_*` tables.
 
 Prefetch requires a Music Assistant release that exposes the native Background
 Tasks controller. Older releases continue to support normal playback and

@@ -60,6 +60,8 @@ from music_assistant_models.streamdetails import StreamDetails
 from music_assistant.helpers.util import infer_album_type, install_package, parse_title_and_version
 from music_assistant.models.music_provider import MusicProvider
 
+from .catalog import PostgresCacheCatalog
+
 try:
     from music_assistant_models.background_task import TaskSchedule
 except ImportError:  # Music Assistant releases before the native task controller
@@ -114,6 +116,7 @@ CONF_AUTH_USER = "auth_user"
 CONF_PREFER_AUDIO_QUALITY = "prefer_audio_quality"
 CONF_CACHE_ENABLED = "cache_enabled"
 CONF_CACHE_DIRECTORY = "cache_directory"
+CONF_CACHE_CATALOG_DSN = "cache_catalog_postgres_dsn"
 CONF_PREFETCH_ENABLED = "prefetch_enabled"
 CONF_PREFETCH_PLAYLISTS = "prefetch_playlists"
 CONF_PREFETCH_INTERVAL = "prefetch_interval_hours"
@@ -360,6 +363,17 @@ async def get_config_entries(
             "on storage that survives Music Assistant restarts.",
         ),
         ConfigEntry(
+            key=CONF_CACHE_CATALOG_DSN,
+            type=ConfigEntryType.SECURE_STRING,
+            label="PostgreSQL cache catalog DSN (optional)",
+            default_value="",
+            required=False,
+            depends_on=CONF_CACHE_ENABLED,
+            depends_on_value=[True],
+            description="Optional postgresql:// DSN for durable prefetch state, retries, "
+            "leases, and cache metadata. Playback remains available if PostgreSQL is down.",
+        ),
+        ConfigEntry(
             key=CONF_PREFETCH_ENABLED,
             type=ConfigEntryType.BOOLEAN,
             label="Prefetch library to cache",
@@ -435,6 +449,8 @@ class YoutubeMusicFreeProvider(MusicProvider):
     _cache_enabled: bool = True
     _cache_directory: str = DEFAULT_CACHE_DIRECTORY
     _cache_writers: set[str]
+    _cache_catalog: PostgresCacheCatalog | None
+    _catalog_claim_attempts: dict[str, int]
     _prefetch_task_id: str
     _prefetch_task_registered: bool
     # Per-category flag: True once we've seen a non-empty sync. Used to tell a
@@ -462,8 +478,29 @@ class YoutubeMusicFreeProvider(MusicProvider):
         )
         self._cache_directory = os.path.abspath(configured_cache_directory)
         self._cache_writers = set()
+        self._cache_catalog = None
+        self._catalog_claim_attempts = {}
         self._prefetch_task_id = f"{self.instance_id}_prefetch"
         self._prefetch_task_registered = False
+        if catalog_dsn := str(
+            self.config.get_value(CONF_CACHE_CATALOG_DSN) or ""
+        ).strip():
+            try:
+                self._cache_catalog = await asyncio.wait_for(
+                    PostgresCacheCatalog.connect(
+                        catalog_dsn,
+                        self.instance_id,
+                        self.logger,
+                    ),
+                    timeout=20,
+                )
+                self.logger.info("Connected to the PostgreSQL cache catalog")
+            except Exception as err:  # noqa: BLE001
+                self.logger.warning(
+                    "PostgreSQL cache catalog unavailable; playback and filesystem "
+                    "cache remain enabled, durable prefetch queue disabled: %s",
+                    type(err).__name__,
+                )
 
         auth_type = self.config.get_value(CONF_AUTH_TYPE) or AUTH_TYPE_NONE
         if auth_type == AUTH_TYPE_COOKIE:
@@ -542,7 +579,25 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 self._prefetch_task_id,
                 clear_persisted_state=is_removed,
             )
+        if catalog := getattr(self, "_cache_catalog", None):
+            with suppress(Exception):
+                await catalog.close()
         await super().unload(is_removed)
+
+    async def _catalog_call(self, method: str, *args: Any) -> Any:
+        """Call the optional catalog without making it a playback dependency."""
+
+        if self._cache_catalog is None:
+            return None
+        try:
+            return await getattr(self._cache_catalog, method)(*args)
+        except Exception as err:  # noqa: BLE001
+            self.logger.warning(
+                "PostgreSQL cache catalog operation %s failed: %s",
+                method,
+                type(err).__name__,
+            )
+            return None
 
     def _config_positive_int(self, key: str, default: int) -> int:
         """Return a positive configured integer or its safe default."""
@@ -1444,6 +1499,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         """Collect uncached library video IDs, optionally including playlists."""
 
         candidates: list[str] = []
+        cached_entries: list[tuple[str, str, int, str]] = []
         seen: set[str] = set()
 
         def add_track(track: Track) -> None:
@@ -1456,31 +1512,52 @@ class YoutubeMusicFreeProvider(MusicProvider):
             ):
                 return
             seen.add(video_id)
-            if self._find_cached_path(video_id) is None:
+            if (cached_path := self._find_cached_path(video_id)) is None:
                 candidates.append(video_id)
+            else:
+                with suppress(OSError):
+                    cached_entries.append(
+                        (
+                            video_id,
+                            cached_path,
+                            os.path.getsize(cached_path),
+                            os.path.splitext(cached_path)[1].lstrip("."),
+                        )
+                    )
 
         async for track in self.get_library_tracks():
             add_track(track)
             if len(candidates) >= limit:
-                return candidates
+                break
 
-        if not self.config.get_value(CONF_PREFETCH_PLAYLISTS):
-            return candidates
-
-        async for playlist in self.get_library_playlists():
-            try:
-                playlist_tracks = await self.get_playlist_tracks(playlist.item_id)
-            except Exception as err:  # noqa: BLE001
-                self.logger.warning(
-                    "Unable to enumerate playlist %s for prefetch: %s",
-                    playlist.item_id,
-                    err,
-                )
-                continue
-            for track in playlist_tracks:
-                add_track(track)
+        if len(candidates) < limit and self.config.get_value(CONF_PREFETCH_PLAYLISTS):
+            async for playlist in self.get_library_playlists():
+                try:
+                    playlist_tracks = await self.get_playlist_tracks(playlist.item_id)
+                except Exception as err:  # noqa: BLE001
+                    self.logger.warning(
+                        "Unable to enumerate playlist %s for prefetch: %s",
+                        playlist.item_id,
+                        err,
+                    )
+                    continue
+                for track in playlist_tracks:
+                    add_track(track)
+                    if len(candidates) >= limit:
+                        break
                 if len(candidates) >= limit:
-                    return candidates
+                    break
+
+        if self._cache_catalog is not None:
+            await self._catalog_call("reconcile_cached", cached_entries)
+        if self._cache_catalog is not None and candidates:
+            await self._catalog_call("enqueue", candidates)
+            claimed = await self._catalog_call("claim", limit)
+            if claimed is not None:
+                self._catalog_claim_attempts = {
+                    job.track_id: job.attempt_count for job in claimed
+                }
+                return [job.track_id for job in claimed]
         return candidates
 
     async def _completed_cache_size(self) -> int:
@@ -1640,23 +1717,58 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 )
             except Exception as err:  # noqa: BLE001
                 failed += 1
+                attempt_count = self._catalog_claim_attempts.get(video_id, 1)
+                error_name = type(err).__name__
+                if status := getattr(err, "status", None):
+                    error_name = f"{error_name} HTTP {status}"
+                await self._catalog_call(
+                    "mark_retry", video_id, error_name, attempt_count
+                )
                 self.logger.warning(
                     "Unable to prefetch YouTube Music track %s: %s",
                     video_id,
-                    err,
+                    error_name,
                 )
                 continue
             if result == "downloaded":
                 downloaded += 1
                 cache_size += added_bytes
+                cached_path = self._find_cached_path(video_id)
+                if cached_path is not None:
+                    await self._catalog_call(
+                        "mark_cached",
+                        video_id,
+                        cached_path,
+                        added_bytes,
+                        os.path.splitext(cached_path)[1].lstrip("."),
+                        None,
+                    )
             elif result == "skipped":
                 skipped += 1
+                cached_path = self._find_cached_path(video_id)
+                if cached_path is not None:
+                    with suppress(OSError):
+                        size_bytes = os.path.getsize(cached_path)
+                        await self._catalog_call(
+                            "mark_cached",
+                            video_id,
+                            cached_path,
+                            size_bytes,
+                            os.path.splitext(cached_path)[1].lstrip("."),
+                            None,
+                        )
+                else:
+                    await self._catalog_call("release", video_id)
             elif result == "paused":
+                for pending_id in candidates[index - 1 :]:
+                    await self._catalog_call("release", pending_id)
                 self.logger.info(
                     "Paused YouTube Music prefetch because foreground playback started"
                 )
                 break
             elif result == "limit":
+                for pending_id in candidates[index - 1 :]:
+                    await self._catalog_call("release", pending_id)
                 self.logger.info(
                     "Stopped YouTube Music prefetch at the configured cache-size limit"
                 )
@@ -2348,7 +2460,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
     async def _install_packages(self) -> None:
         """Install required packages if not already present."""
-        for pkg in ("yt-dlp[default]", "ytmusicapi"):
+        for pkg in ("yt-dlp[default]", "ytmusicapi", "asyncpg"):
             await install_package(pkg)
         try:
             await asyncio.to_thread(importlib.import_module, "yt_dlp")
@@ -2358,3 +2470,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             await asyncio.to_thread(importlib.import_module, "ytmusicapi")
         except ImportError as err:
             raise SetupFailedError("ytmusicapi failed to install") from err
+        try:
+            await asyncio.to_thread(importlib.import_module, "asyncpg")
+        except ImportError as err:
+            raise SetupFailedError("asyncpg failed to install") from err

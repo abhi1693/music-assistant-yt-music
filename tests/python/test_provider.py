@@ -944,6 +944,7 @@ def test_get_config_entries_returns_expected_keys():
         ytm.CONF_PREFER_AUDIO_QUALITY,
         ytm.CONF_CACHE_ENABLED,
         ytm.CONF_CACHE_DIRECTORY,
+        ytm.CONF_CACHE_CATALOG_DSN,
         ytm.CONF_PREFETCH_ENABLED,
         ytm.CONF_PREFETCH_PLAYLISTS,
         ytm.CONF_PREFETCH_INTERVAL,
@@ -1067,6 +1068,45 @@ def test_prefetch_downloads_library_tracks_with_native_progress(provider, tmp_pa
         100,
         "Downloaded 2, skipped 0, failed 0",
     )
+
+
+def test_prefetch_uses_durable_catalog_claims(provider, tmp_path):
+    """Catalog-backed prefetch downloads only atomically claimed jobs."""
+
+    from ytmusic_free.catalog import CacheJob
+
+    class Catalog:
+        enqueued = []
+        reconciled = []
+
+        async def enqueue(self, track_ids, priority=100):
+            self.enqueued = list(track_ids)
+
+        async def reconcile_cached(self, entries):
+            self.reconciled = list(entries)
+
+        async def claim(self, limit):
+            return [CacheJob("second-video", 2)]
+
+    async def library_tracks():
+        for item_id in ("first-video", "second-video"):
+            yield ytm.Track(
+                item_id=item_id,
+                provider=provider.instance_id,
+                name=item_id,
+            )
+
+    provider.config = SimpleNamespace(get_value=lambda _key: False)
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+    provider._cache_catalog = Catalog()
+    provider.get_library_tracks = library_tracks
+
+    candidates = asyncio.run(provider._prefetch_candidates(100))
+
+    assert candidates == ["second-video"]
+    assert provider._cache_catalog.enqueued == ["first-video", "second-video"]
+    assert provider._catalog_claim_attempts == {"second-video": 2}
 
 
 def test_prefetch_pauses_without_downloading_during_playback(provider, tmp_path):

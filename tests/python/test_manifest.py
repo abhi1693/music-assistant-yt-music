@@ -41,6 +41,7 @@ def test_manifest_requirements_pin_known_libs(manifest):
     joined = " ".join(requirements)
     assert "ytmusicapi" in joined
     assert "yt-dlp" in joined
+    assert "asyncpg" in joined
     # duration-parser was dropped once timestamp parsing moved in-house (PR #29);
     # guard against it creeping back as a needless dependency.
     assert "duration-parser" not in joined
