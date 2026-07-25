@@ -19,6 +19,7 @@ import importlib
 import logging
 import os
 import re
+import shutil
 import time
 from collections.abc import AsyncGenerator
 from contextlib import suppress
@@ -116,6 +117,7 @@ CONF_AUTH_USER = "auth_user"
 CONF_PREFER_AUDIO_QUALITY = "prefer_audio_quality"
 CONF_CACHE_ENABLED = "cache_enabled"
 CONF_CACHE_DIRECTORY = "cache_directory"
+CONF_CACHE_STAGING_DIRECTORY = "cache_staging_directory"
 CONF_CACHE_CATALOG_DSN = "cache_catalog_postgres_dsn"
 CONF_PREFETCH_ENABLED = "prefetch_enabled"
 CONF_PREFETCH_PLAYLISTS = "prefetch_playlists"
@@ -126,6 +128,12 @@ CONF_PREFETCH_PAUSE_PLAYBACK = "prefetch_pause_playback"
 AUTH_TYPE_NONE = "none"
 AUTH_TYPE_COOKIE = "cookie"
 DEFAULT_CACHE_DIRECTORY = "/data/ytmusic-cache"
+DEFAULT_CACHE_STAGING_DIRECTORY = "/data/ytmusic-cache-staging"
+
+
+class _PrefetchPaused(Exception):
+    """Stop yt-dlp without discarding its resumable partial file."""
+
 
 # Releases before multi-instance support wrote the browser auth headers to this
 # fixed path inside the MA container and handed ytmusicapi the filename. Auth is
@@ -363,6 +371,17 @@ async def get_config_entries(
             "on storage that survives Music Assistant restarts.",
         ),
         ConfigEntry(
+            key=CONF_CACHE_STAGING_DIRECTORY,
+            type=ConfigEntryType.STRING,
+            label="Cache staging directory",
+            default_value=DEFAULT_CACHE_STAGING_DIRECTORY,
+            required=False,
+            depends_on=CONF_CACHE_ENABLED,
+            depends_on_value=[True],
+            description="Persistent local path used for resumable yt-dlp downloads before "
+            "completed files are atomically published to the cache directory.",
+        ),
+        ConfigEntry(
             key=CONF_CACHE_CATALOG_DSN,
             type=ConfigEntryType.SECURE_STRING,
             label="PostgreSQL cache catalog DSN (optional)",
@@ -449,6 +468,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
     _auth_lapse_warned: bool = False
     _cache_enabled: bool = True
     _cache_directory: str = DEFAULT_CACHE_DIRECTORY
+    _cache_staging_directory: str = DEFAULT_CACHE_STAGING_DIRECTORY
     _cache_writers: set[str]
     _cache_catalog: PostgresCacheCatalog | None
     _catalog_claim_attempts: dict[str, int]
@@ -478,6 +498,13 @@ class YoutubeMusicFreeProvider(MusicProvider):
             self.config.get_value(CONF_CACHE_DIRECTORY) or DEFAULT_CACHE_DIRECTORY
         )
         self._cache_directory = os.path.abspath(configured_cache_directory)
+        configured_staging_directory = str(
+            self.config.get_value(CONF_CACHE_STAGING_DIRECTORY)
+            or DEFAULT_CACHE_STAGING_DIRECTORY
+        )
+        self._cache_staging_directory = os.path.abspath(
+            configured_staging_directory
+        )
         self._cache_writers = set()
         self._cache_catalog = None
         self._catalog_claim_attempts = {}
@@ -599,6 +626,22 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 type(err).__name__,
             )
             return None
+
+    async def _prioritize_cache_track(self, video_id: str) -> None:
+        """Promote a requested miss without making playback wait on PostgreSQL."""
+
+        if self._cache_catalog is None:
+            return
+        try:
+            await asyncio.wait_for(
+                self._catalog_call("enqueue", [video_id], 0),
+                timeout=0.5,
+            )
+        except TimeoutError:
+            self.logger.debug(
+                "Timed out prioritizing YouTube Music cache track %s",
+                video_id,
+            )
 
     def _config_positive_int(self, key: str, default: int) -> int:
         """Return a positive configured integer or its safe default."""
@@ -1400,6 +1443,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 expiration=0,
             )
 
+        if self._cache_enabled and start is None and end is None:
+            await self._prioritize_cache_track(video_id)
+
         stream_format = await self._get_stream_format(video_id)
         self.logger.debug(
             "Resolved stream format '%s' for track %s", stream_format.get("format"), video_id
@@ -1553,12 +1599,6 @@ class YoutubeMusicFreeProvider(MusicProvider):
             await self._catalog_call("reconcile_cached", cached_entries)
         if self._cache_catalog is not None and candidates:
             await self._catalog_call("enqueue", candidates)
-            claimed = await self._catalog_call("claim", limit)
-            if claimed is not None:
-                self._catalog_claim_attempts = {
-                    job.track_id: job.attempt_count for job in claimed
-                }
-                return [job.track_id for job in claimed]
         return candidates
 
     async def _completed_cache_size(self) -> int:
@@ -1581,6 +1621,72 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
         return await asyncio.to_thread(calculate)
 
+    def _download_to_staging(
+        self,
+        video_id: str,
+        stream_format: dict[str, Any],
+        staging_path: str,
+        pause_during_playback: bool,
+    ) -> None:
+        """Use yt-dlp's resumable, chunked downloader on persistent local storage."""
+
+        if os.path.isfile(staging_path):
+            return
+        if self._yt_dlp_module is None:
+            self._yt_dlp_module = importlib.import_module("yt_dlp")
+
+        def progress_hook(_status: dict[str, Any]) -> None:
+            if pause_during_playback and self._foreground_playback_active():
+                raise _PrefetchPaused
+
+        format_id = stream_format.get("format_id")
+        selector = str(format_id) if format_id else (
+            "bestaudio/best"
+            if self._prefer_quality
+            else "bestaudio[ext=m4a]/bestaudio/best"
+        )
+        options = {
+            "quiet": True,
+            "noprogress": True,
+            "no_warnings": True,
+            "format": selector,
+            "outtmpl": staging_path,
+            "continuedl": True,
+            "nopart": False,
+            "overwrites": False,
+            "retries": 10,
+            "file_access_retries": 3,
+            # YouTube commonly paces one continuous media response. yt-dlp
+            # rotates bounded range requests when this value is set.
+            "http_chunk_size": 10 * 1024 * 1024,
+            "progress_hooks": [progress_hook],
+            "extractor_args": {
+                "youtube": {
+                    "skip": ["translated_subs", "dash"],
+                },
+            },
+        }
+        os.makedirs(self._cache_staging_directory, mode=0o775, exist_ok=True)
+        with self._yt_dlp_module.YoutubeDL(options) as ydl:
+            result = ydl.download([f"{YTM_DOMAIN}/watch?v={video_id}"])
+        if result not in (None, 0) or not os.path.isfile(staging_path):
+            raise RuntimeError("yt-dlp did not produce the staged audio file")
+
+    @staticmethod
+    def _publish_staged_file(staging_path: str, cache_path: str) -> int:
+        """Copy a complete local stage to NFS and atomically expose it."""
+
+        partial_path = f"{cache_path}.part"
+        os.makedirs(os.path.dirname(cache_path), mode=0o775, exist_ok=True)
+        with open(staging_path, "rb") as source, open(partial_path, "wb") as target:
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(partial_path, cache_path)
+        size_bytes = os.path.getsize(cache_path)
+        os.remove(staging_path)
+        return size_bytes
+
     async def _prefetch_track(
         self,
         video_id: str,
@@ -1599,51 +1705,46 @@ class YoutubeMusicFreeProvider(MusicProvider):
         audio_ext = stream_format.get("audio_ext") or stream_format.get("ext", "m4a")
         safe_audio_ext = re.sub(r"[^a-z0-9]", "", str(audio_ext).lower()) or "audio"
         cache_path = self._cache_path(video_id, safe_audio_ext)
-        partial_path = f"{cache_path}.part"
+        staging_path = os.path.join(
+            self._cache_staging_directory,
+            os.path.basename(cache_path),
+        )
         if os.path.isfile(cache_path) or cache_path in self._cache_writers:
             return ("skipped", 0)
 
-        headers = {
-            str(key): str(value)
-            for key, value in (stream_format.get("http_headers") or {}).items()
-        }
-        cache_file = None
         completed = False
-        bytes_written = 0
         self._cache_writers.add(cache_path)
         try:
-            await asyncio.to_thread(
-                os.makedirs,
-                self._cache_directory,
-                mode=0o775,
-                exist_ok=True,
+            expected_size = stream_format.get("filesize") or stream_format.get(
+                "filesize_approx"
             )
-            cache_file = await asyncio.to_thread(open, partial_path, "wb")
-            async with self.mass.http_session.get(
-                str(stream_format["url"]), headers=headers
-            ) as response:
-                response.raise_for_status()
-                if (
-                    cache_limit is not None
-                    and response.content_length is not None
-                    and cache_size + response.content_length > cache_limit
-                ):
-                    return ("limit", 0)
-                async for chunk in response.content.iter_chunked(64 * 1024):
-                    if pause_during_playback and self._foreground_playback_active():
-                        return ("paused", 0)
-                    if (
-                        cache_limit is not None
-                        and cache_size + bytes_written + len(chunk) > cache_limit
-                    ):
-                        return ("limit", 0)
-                    await asyncio.to_thread(cache_file.write, chunk)
-                    bytes_written += len(chunk)
-            await asyncio.to_thread(cache_file.flush)
-            await asyncio.to_thread(os.fsync, cache_file.fileno())
-            await asyncio.to_thread(cache_file.close)
-            cache_file = None
-            await asyncio.to_thread(os.replace, partial_path, cache_path)
+            if (
+                cache_limit is not None
+                and expected_size is not None
+                and cache_size + int(expected_size) > cache_limit
+            ):
+                return ("limit", 0)
+            try:
+                await asyncio.to_thread(
+                    self._download_to_staging,
+                    video_id,
+                    stream_format,
+                    staging_path,
+                    pause_during_playback,
+                )
+            except _PrefetchPaused:
+                return ("paused", 0)
+            staged_size = await asyncio.to_thread(os.path.getsize, staging_path)
+            if (
+                cache_limit is not None
+                and cache_size + staged_size > cache_limit
+            ):
+                return ("limit", 0)
+            bytes_written = await asyncio.to_thread(
+                self._publish_staged_file,
+                staging_path,
+                cache_path,
+            )
             completed = True
             self.logger.info(
                 "Prefetched YouTube Music track %s to %s",
@@ -1652,13 +1753,12 @@ class YoutubeMusicFreeProvider(MusicProvider):
             )
             return ("downloaded", bytes_written)
         finally:
-            if cache_file is not None:
-                with suppress(OSError):
-                    await asyncio.to_thread(cache_file.close)
             self._cache_writers.discard(cache_path)
             if not completed:
+                # A failed NFS publication is safe to retry from the complete
+                # local stage. Never accept its destination partial as a hit.
                 with suppress(OSError):
-                    await asyncio.to_thread(os.remove, partial_path)
+                    await asyncio.to_thread(os.remove, f"{cache_path}.part")
 
     async def _run_cache_prefetch(self) -> None:
         """Prefetch uncached authenticated-library tracks as a native MA task."""
@@ -1693,7 +1793,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             return
 
         candidates = await self._prefetch_candidates(max_tracks)
-        if not candidates:
+        if not candidates and self._cache_catalog is None:
             self.mass.tasks.update_current_task_progress(
                 100, "All selected YouTube Music tracks are cached"
             )
@@ -1703,11 +1803,25 @@ class YoutubeMusicFreeProvider(MusicProvider):
         downloaded = 0
         skipped = 0
         failed = 0
-        for index, video_id in enumerate(candidates, start=1):
-            progress = int(((index - 1) / len(candidates)) * 100)
+        processed = 0
+        while processed < max_tracks:
+            if self._cache_catalog is not None:
+                claimed = await self._catalog_call("claim", 1)
+                if not claimed:
+                    break
+                job = claimed[0]
+                video_id = job.track_id
+                self._catalog_claim_attempts[video_id] = job.attempt_count
+            else:
+                if processed >= len(candidates):
+                    break
+                video_id = candidates[processed]
+            processed += 1
+            task_total = min(max_tracks, max(1, len(candidates)))
+            progress = int(((processed - 1) / task_total) * 100)
             self.mass.tasks.update_current_task_progress(
                 progress,
-                f"Caching track {index}/{len(candidates)}",
+                f"Caching track {processed}/{task_total}",
             )
             try:
                 result, added_bytes = await self._prefetch_track(
@@ -1761,15 +1875,13 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 else:
                     await self._catalog_call("release", video_id)
             elif result == "paused":
-                for pending_id in candidates[index - 1 :]:
-                    await self._catalog_call("release", pending_id)
+                await self._catalog_call("release", video_id)
                 self.logger.info(
                     "Paused YouTube Music prefetch because foreground playback started"
                 )
                 break
             elif result == "limit":
-                for pending_id in candidates[index - 1 :]:
-                    await self._catalog_call("release", pending_id)
+                await self._catalog_call("release", video_id)
                 self.logger.info(
                     "Stopped YouTube Music prefetch at the configured cache-size limit"
                 )

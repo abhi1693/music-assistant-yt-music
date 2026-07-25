@@ -27,20 +27,20 @@ Podcast support is not implemented.
 | Component | Responsibility |
 | --- | --- |
 | `ytmusicapi` | Catalogue metadata and authenticated account features |
-| `yt-dlp` | Resolving playable audio formats and playlist fallbacks |
+| `yt-dlp` | Resolving formats and performing resumable background downloads |
 | Music Assistant | Library management, queueing, decoding, normalization, and players |
-| Read-through cache | Retaining the original completed audio response for later plays |
+| Persistent cache | Serving atomically published background downloads locally |
 
-For an uncached track, the provider opens one upstream response. The same bytes
-are sent to Music Assistant and written to a temporary `.part` file. A complete
-download is flushed and atomically promoted to its final cache filename.
-Interrupted or failed transfers are not accepted as cache hits.
+An uncached foreground play starts immediately from YouTube. Independently, the
+native background task uses yt-dlp to download into persistent local staging,
+where interrupted transfers can resume. A complete stage is copied, flushed,
+and atomically promoted on the cache filesystem. Interrupted transfers and
+publication copies are never accepted as cache hits.
 
 Before any custom stream begins, the provider checks the cache again. This
-matters because Music Assistant may preload stream details while an earlier
-request is still downloading. If that earlier request has since completed, the
-preloaded request reads the new local file instead of downloading the track
-again.
+matters because Music Assistant may preload stream details while the background
+task is downloading. If the file has since been published, the preloaded request
+reads it locally instead of opening another YouTube stream.
 
 ## Important limitations
 
@@ -201,6 +201,7 @@ name without changing its internal `ytmusic_free` domain.
 | Prefer highest audio quality | Enabled | Selects yt-dlp's highest-ranked accessible audio format |
 | Cache streamed tracks | Enabled | Reuses completed local files and enables background prefetch |
 | Cache directory | `/data/ytmusic-cache` | Writable persistent cache location |
+| Cache staging directory | `/data/ytmusic-cache-staging` | Persistent local workspace for resumable yt-dlp downloads |
 | PostgreSQL cache catalog DSN | Empty | Enables durable queue, leases, retries, and cache metadata |
 | Prefetch library to cache | Disabled | Registers an app-native scheduled cache task |
 | Include playlists in prefetch | Disabled | Adds authenticated library playlists to the prefetch scope |
@@ -294,11 +295,15 @@ by persistent storage if it should survive container replacement.
 
 ### Lifecycle
 
-1. An uncached stream writes to `<track-hash>.<extension>.part`.
-2. The same bytes are forwarded to Music Assistant during playback.
-3. At completion, the provider flushes and atomically renames the file.
-4. Later plays return a local-file stream.
-5. Preloaded requests recheck disk before opening YouTube.
+1. Foreground cache misses remain ordinary YouTube streams and never write
+   cache files.
+2. The native background task downloads to the persistent staging directory
+   using yt-dlp's resumable downloader and bounded HTTP range requests.
+3. yt-dlp retains an interrupted `<track-hash>.<extension>.part` in staging.
+4. A completed stage is copied to a destination `.part` file, flushed, and
+   atomically renamed within the cache filesystem.
+5. Later plays return the completed local-file stream.
+6. Preloaded requests recheck disk before opening YouTube.
 
 The filename is a SHA-256 hash of the YouTube video ID. The extension reflects
 the selected upstream container, commonly `.webm` for Opus.
@@ -320,9 +325,10 @@ again and a missing file is downloaded normally.
 Partial files:
 
 - Are never considered cache hits
-- Are removed after an interrupted or failed managed stream
-- Can remain after an ungraceful process or host failure and may be safely
-  removed when no stream is active
+- In the staging directory, survive provider and container restarts so yt-dlp
+  can resume them
+- In the cache directory, are incomplete publication copies and are removed
+  after a failed publication attempt
 
 Cache-storage failures are logged but do not block playback.
 
@@ -333,6 +339,7 @@ services:
   music-assistant:
     volumes:
       - /mnt/media/music/YouTube Music:/data/ytmusic-cache
+      - music-assistant-data:/data/ytmusic-cache-staging
 ```
 
 For NFS, ensure the Music Assistant container's UID/GID can create, flush,
@@ -354,16 +361,22 @@ Each run:
 1. Enumerates authenticated library tracks.
 2. Optionally enumerates tracks from library playlists.
 3. Skips completed cache entries.
-4. Downloads at most the configured number of new tracks, sequentially.
-5. Uses the provider's audio-quality selector and atomic cache publication.
-6. Stops at the configured cache-size ceiling without deleting existing files.
-7. Pauses when foreground playback is active when that protection is enabled.
+4. Claims one PostgreSQL job at a time so a newly requested cache miss can
+   move ahead of untouched bulk-library work.
+5. Downloads at most the configured number of new tracks, sequentially.
+6. Uses yt-dlp's resumable, chunked downloader, the provider's audio-quality
+   selector, local staging, and atomic cache publication.
+7. Stops at the configured cache-size ceiling without deleting existing files.
+8. Pauses when foreground playback is active when that protection is enabled.
 
 Without a catalog DSN, completed cache files remain the durable task state and
 the next execution rescans the library. With a PostgreSQL DSN, the provider
 also persists pending, downloading, retry, failed, and cached states. Workers
 claim jobs using `FOR UPDATE SKIP LOCKED` and a 15-minute lease. Failures use
 bounded exponential backoff and become terminal after ten attempts.
+An uncached track requested for playback is inserted at priority zero; ordinary
+library inventory uses priority 100. Playback still uses its normal remote
+stream immediately and does not wait for the background download.
 
 The PostgreSQL integration is fail-open: connection or query failures disable
 durable coordination for that run but do not prevent normal remote playback or

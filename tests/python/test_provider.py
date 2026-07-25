@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -944,6 +946,7 @@ def test_get_config_entries_returns_expected_keys():
         ytm.CONF_PREFER_AUDIO_QUALITY,
         ytm.CONF_CACHE_ENABLED,
         ytm.CONF_CACHE_DIRECTORY,
+        ytm.CONF_CACHE_STAGING_DIRECTORY,
         ytm.CONF_CACHE_CATALOG_DSN,
         ytm.CONF_PREFETCH_ENABLED,
         ytm.CONF_PREFETCH_PLAYLISTS,
@@ -1074,10 +1077,8 @@ def test_prefetch_downloads_library_tracks_with_native_progress(provider, tmp_pa
     )
 
 
-def test_prefetch_uses_durable_catalog_claims(provider, tmp_path):
-    """Catalog-backed prefetch downloads only atomically claimed jobs."""
-
-    from ytmusic_free.catalog import CacheJob
+def test_prefetch_enqueues_durable_catalog_candidates(provider, tmp_path):
+    """Inventory enumeration queues work without leasing the full batch."""
 
     class Catalog:
         enqueued = []
@@ -1088,9 +1089,6 @@ def test_prefetch_uses_durable_catalog_claims(provider, tmp_path):
 
         async def reconcile_cached(self, entries):
             self.reconciled = list(entries)
-
-        async def claim(self, limit):
-            return [CacheJob("second-video", 2)]
 
     async def library_tracks():
         for item_id in ("first-video", "second-video"):
@@ -1108,9 +1106,75 @@ def test_prefetch_uses_durable_catalog_claims(provider, tmp_path):
 
     candidates = asyncio.run(provider._prefetch_candidates(100))
 
-    assert candidates == ["second-video"]
+    assert candidates == ["first-video", "second-video"]
     assert provider._cache_catalog.enqueued == ["first-video", "second-video"]
-    assert provider._catalog_claim_attempts == {"second-video": 2}
+    assert provider._catalog_claim_attempts == {}
+
+
+def test_requested_cache_miss_receives_demand_priority(provider):
+    """A foreground miss is queued ahead of ordinary library inventory."""
+
+    class Catalog:
+        calls = []
+
+        async def enqueue(self, track_ids, priority=100):
+            self.calls.append((list(track_ids), priority))
+
+    provider._cache_catalog = Catalog()
+
+    asyncio.run(provider._prioritize_cache_track("requested-video"))
+
+    assert provider._cache_catalog.calls == [(["requested-video"], 0)]
+
+
+def test_catalog_prefetch_claims_only_one_job_at_a_time(provider, tmp_path):
+    """Sequential claims leave later jobs eligible for demand reprioritization."""
+
+    from ytmusic_free.catalog import CacheJob
+
+    class Catalog:
+        claims = []
+        jobs = [CacheJob("first-video", 1), CacheJob("second-video", 1)]
+
+        async def claim(self, limit):
+            self.claims.append(limit)
+            return [self.jobs.pop(0)] if self.jobs else []
+
+        async def mark_cached(self, *_args):
+            return None
+
+    downloaded = []
+
+    async def prefetch_candidates(_limit):
+        return ["first-video", "second-video"]
+
+    async def prefetch_track(video_id, *_args):
+        downloaded.append(video_id)
+        cache_file = tmp_path / f"{hashlib.sha256(video_id.encode()).hexdigest()}.webm"
+        cache_file.write_bytes(b"audio")
+        return ("downloaded", 5)
+
+    values = {
+        ytm.CONF_PREFETCH_MAX_TRACKS: 100,
+        ytm.CONF_PREFETCH_MAX_CACHE_GB: 50,
+        ytm.CONF_PREFETCH_PAUSE_PLAYBACK: False,
+    }
+    provider.config = SimpleNamespace(get_value=values.get)
+    provider.mass = SimpleNamespace(
+        players=[],
+        tasks=SimpleNamespace(update_current_task_progress=lambda *_args: None),
+    )
+    provider._authenticated = True
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+    provider._cache_catalog = Catalog()
+    provider._prefetch_candidates = prefetch_candidates
+    provider._prefetch_track = prefetch_track
+
+    asyncio.run(provider._run_cache_prefetch())
+
+    assert downloaded == ["first-video", "second-video"]
+    assert provider._cache_catalog.claims == [1, 1, 1]
 
 
 def test_prefetch_pauses_without_downloading_during_playback(provider, tmp_path):
@@ -1158,42 +1222,43 @@ def test_prefetch_continues_during_playback_by_default(provider, tmp_path):
 
 
 def test_prefetch_track_atomically_publishes_completed_audio(provider, tmp_path):
-    """Background downloads use the same durable final-file contract."""
+    """yt-dlp stages locally before atomically publishing to the cache."""
 
     payload = b"prefetched audio"
+    cache_dir = tmp_path / "cache"
+    staging_dir = tmp_path / "staging"
+    observed_options = {}
 
-    class Content:
-        async def iter_chunked(self, _size):
-            yield payload
+    class YoutubeDL:
+        def __init__(self, options):
+            observed_options.update(options)
 
-    class Response:
-        content = Content()
-        content_length = len(payload)
-
-        async def __aenter__(self):
+        def __enter__(self):
             return self
 
-        async def __aexit__(self, *_args):
+        def __exit__(self, *_args):
             return None
 
-        def raise_for_status(self):
-            return None
-
-    class Session:
-        def get(self, _url, headers=None):
-            return Response()
+        def download(self, _urls):
+            output = Path(observed_options["outtmpl"])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(payload)
+            return 0
 
     async def stream_format(_video_id):
         return {
             "url": "https://stream.example/audio",
             "audio_ext": "webm",
+            "format_id": "251",
             "http_headers": {},
         }
 
-    provider.mass = SimpleNamespace(http_session=Session(), players=[])
+    provider.mass = SimpleNamespace(players=[])
     provider._cache_enabled = True
-    provider._cache_directory = str(tmp_path)
+    provider._cache_directory = str(cache_dir)
+    provider._cache_staging_directory = str(staging_dir)
     provider._cache_writers = set()
+    provider._yt_dlp_module = SimpleNamespace(YoutubeDL=YoutubeDL)
     provider._get_stream_format = stream_format
 
     result, added_bytes = asyncio.run(
@@ -1207,11 +1272,72 @@ def test_prefetch_track_atomically_publishes_completed_audio(provider, tmp_path)
 
     assert result == "downloaded"
     assert added_bytes == len(payload)
-    files = list(tmp_path.iterdir())
+    files = list(cache_dir.iterdir())
     assert len(files) == 1
     assert files[0].suffix == ".webm"
     assert files[0].read_bytes() == payload
-    assert not list(tmp_path.glob("*.part"))
+    assert not list(cache_dir.glob("*.part"))
+    assert not list(staging_dir.iterdir())
+    assert observed_options["continuedl"] is True
+    assert observed_options["http_chunk_size"] == 10 * 1024 * 1024
+    assert observed_options["format"] == "251"
+
+
+def test_prefetch_resumes_existing_ytdlp_partial(provider, tmp_path):
+    """A stable staging filename lets yt-dlp resume after provider restart."""
+
+    cache_dir = tmp_path / "cache"
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    observed = {}
+
+    class YoutubeDL:
+        def __init__(self, options):
+            observed.update(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def download(self, _urls):
+            output = Path(observed["outtmpl"])
+            partial = Path(f"{output}.part")
+            assert partial.read_bytes() == b"first half"
+            output.write_bytes(partial.read_bytes() + b" second half")
+            partial.unlink()
+            return 0
+
+    async def stream_format(_video_id):
+        return {
+            "url": "https://stream.example/audio",
+            "audio_ext": "webm",
+            "format_id": "251",
+        }
+
+    provider.mass = SimpleNamespace(players=[])
+    provider._cache_enabled = True
+    provider._cache_directory = str(cache_dir)
+    provider._cache_staging_directory = str(staging_dir)
+    provider._cache_writers = set()
+    provider._yt_dlp_module = SimpleNamespace(YoutubeDL=YoutubeDL)
+    provider._get_stream_format = stream_format
+    stage = staging_dir / f"{hashlib.sha256(b'prefetch-video').hexdigest()}.webm"
+    Path(f"{stage}.part").write_bytes(b"first half")
+
+    result, added_bytes = asyncio.run(
+        provider._prefetch_track(
+            "prefetch-video",
+            cache_size=0,
+            cache_limit=1024 * 1024,
+            pause_during_playback=False,
+        )
+    )
+
+    assert result == "downloaded"
+    assert added_bytes == len(b"first half second half")
+    assert next(cache_dir.iterdir()).read_bytes() == b"first half second half"
 
 
 

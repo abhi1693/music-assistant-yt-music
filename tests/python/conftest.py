@@ -426,6 +426,7 @@ def provider():
     instance._yt_dlp_module = None
     instance._prefer_quality = True
     instance._authenticated = False
+    instance._cache_staging_directory = ""
     instance._cache_catalog = None
     instance._catalog_claim_attempts = {}
     return instance
