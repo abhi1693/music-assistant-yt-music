@@ -429,11 +429,12 @@ async def get_config_entries(
             key=CONF_PREFETCH_PAUSE_PLAYBACK,
             type=ConfigEntryType.BOOLEAN,
             label="Pause prefetch while players are active",
-            default_value=True,
+            default_value=False,
             required=False,
             depends_on=CONF_PREFETCH_ENABLED,
             depends_on_value=[True],
-            description="Keep foreground playback ahead of background downloads.",
+            description="Opt in to stopping background downloads during playback. "
+            "Disabled by default so prefetch continues while players are active.",
         ),
     )
 
@@ -1668,7 +1669,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
         configured_pause = self.config.get_value(CONF_PREFETCH_PAUSE_PLAYBACK)
         pause_during_playback = (
-            True if configured_pause is None else bool(configured_pause)
+            False if configured_pause is None else bool(configured_pause)
         )
         if pause_during_playback and self._foreground_playback_active():
             self.logger.info("Skipping YouTube Music prefetch while a player is active")

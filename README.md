@@ -207,7 +207,7 @@ name without changing its internal `ytmusic_free` domain.
 | Prefetch interval | 6 hours | Recurring Music Assistant task schedule |
 | Maximum tracks per run | 100 | Bounds work performed by one task run |
 | Maximum cache size | 50 GB | Stops prefetch without evicting completed files; `0` disables the limit |
-| Pause prefetch while players are active | Enabled | Preserves foreground playback bandwidth |
+| Pause prefetch while players are active | Disabled | Optional bandwidth protection; downloads continue during playback by default |
 
 ## Optional account authentication
 

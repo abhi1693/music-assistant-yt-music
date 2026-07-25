@@ -955,6 +955,10 @@ def test_get_config_entries_returns_expected_keys():
     cookie_entry = next(e for e in entries if e.key == ytm.CONF_COOKIE)
     assert cookie_entry.depends_on == ytm.CONF_AUTH_TYPE
     assert cookie_entry.depends_on_value == [ytm.AUTH_TYPE_COOKIE]
+    pause_entry = next(
+        e for e in entries if e.key == ytm.CONF_PREFETCH_PAUSE_PLAYBACK
+    )
+    assert pause_entry.default_value is False
 
 
 
@@ -1128,6 +1132,29 @@ def test_prefetch_pauses_without_downloading_during_playback(provider, tmp_path)
 
     provider._prefetch_candidates = should_not_enumerate
     asyncio.run(provider._run_cache_prefetch())
+
+
+def test_prefetch_continues_during_playback_by_default(provider, tmp_path):
+    """An unset gate must not suppress production background downloads."""
+
+    player = SimpleNamespace(playback_state=SimpleNamespace(value="playing"))
+    tasks = SimpleNamespace(update_current_task_progress=lambda *_args: None)
+    provider.mass = SimpleNamespace(tasks=tasks, players=[player])
+    provider.config = SimpleNamespace(get_value=lambda _key: None)
+    provider._authenticated = True
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+    enumerated = False
+
+    async def enumerate_candidates(_limit):
+        nonlocal enumerated
+        enumerated = True
+        return []
+
+    provider._prefetch_candidates = enumerate_candidates
+    asyncio.run(provider._run_cache_prefetch())
+
+    assert enumerated is True
 
 
 def test_prefetch_track_atomically_publishes_completed_audio(provider, tmp_path):
