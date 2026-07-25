@@ -1241,6 +1241,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             data={
                 "http_headers": stream_format.get("http_headers") or {},
                 "cache_path": cache_path,
+                "expected_size": stream_format.get("filesize"),
             },
         )
         if channels := stream_format.get("audio_channels"):
@@ -1307,6 +1308,12 @@ class YoutubeMusicFreeProvider(MusicProvider):
         partial_path = f"{cache_path}.part"
         completed = False
         cache_file = None
+        bytes_written = 0
+        expected_size = data.get("expected_size")
+        try:
+            expected_size = int(expected_size) if expected_size is not None else None
+        except (TypeError, ValueError):
+            expected_size = None
         self._cache_writers.add(cache_path)
         try:
             try:
@@ -1338,9 +1345,12 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 str(streamdetails.path), headers=headers
             ) as response:
                 response.raise_for_status()
+                if response.content_length is not None:
+                    expected_size = response.content_length
                 async for chunk in response.content.iter_chunked(64 * 1024):
                     if cache_file is not None:
                         cache_file.write(chunk)
+                        bytes_written += len(chunk)
                     yield chunk
                 if cache_file is not None:
                     cache_file.flush()
@@ -1356,7 +1366,28 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     )
         finally:
             if cache_file is not None:
+                cache_file.flush()
+                os.fsync(cache_file.fileno())
                 cache_file.close()
+                cache_file = None
+                # Music Assistant may close the async generator immediately after
+                # consuming its final yielded chunk. In that lifecycle the loop
+                # body has received the complete response, but control never
+                # reaches the normal EOF publication block above. Promote only
+                # when the exact upstream byte count proves the file is complete.
+                if (
+                    not completed
+                    and expected_size is not None
+                    and bytes_written == expected_size
+                    and bytes_written > 0
+                ):
+                    await asyncio.to_thread(os.replace, partial_path, cache_path)
+                    completed = True
+                    self.logger.info(
+                        "Cached YouTube Music track %s at %s",
+                        streamdetails.item_id,
+                        cache_path,
+                    )
             self._cache_writers.discard(cache_path)
             if not completed:
                 with suppress(OSError):

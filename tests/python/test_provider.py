@@ -960,6 +960,7 @@ def test_completed_stream_is_cached_and_reused(provider, tmp_path):
 
     class Response:
         content = Content()
+        content_length = len(b"first play")
 
         async def __aenter__(self):
             return self
@@ -1005,6 +1006,12 @@ def test_completed_stream_is_cached_and_reused(provider, tmp_path):
     assert cached.stream_type == StreamType.LOCAL_FILE
     assert cached.path.endswith(".m4a")
     assert open(cached.path, "rb").read() == b"first play"
+    provider._cache_writers = set()  # simulate fresh provider state after restart
+    persisted = asyncio.run(
+        provider.get_stream_details("dQw4w9WgXcQ", MediaType.TRACK)
+    )
+    assert persisted.stream_type == StreamType.LOCAL_FILE
+    assert persisted.path == cached.path
 
 
 def test_interrupted_stream_does_not_publish_partial_cache(provider, tmp_path):
@@ -1017,6 +1024,7 @@ def test_interrupted_stream_does_not_publish_partial_cache(provider, tmp_path):
 
     class Response:
         content = Content()
+        content_length = len(b"partialunreachable")
 
         async def __aenter__(self):
             return self
@@ -1050,6 +1058,56 @@ def test_interrupted_stream_does_not_publish_partial_cache(provider, tmp_path):
 
     asyncio.run(interrupt())
     assert list(tmp_path.iterdir()) == []
+
+
+def test_final_yield_is_promoted_when_music_assistant_closes_generator(provider, tmp_path):
+    """A complete final chunk must survive MA closing before loop exhaustion."""
+
+    payload = b"complete response"
+
+    class Content:
+        async def iter_chunked(self, _size):
+            yield payload
+
+    class Response:
+        content = Content()
+        content_length = len(payload)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+    class Session:
+        def get(self, _url, headers=None):
+            return Response()
+
+    provider.mass = SimpleNamespace(http_session=Session())
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+    provider._cache_writers = set()
+
+    async def consume_then_close():
+        cache_path = tmp_path / "track.webm"
+        details = StreamDetails(
+            provider=provider.instance_id,
+            item_id="dQw4w9WgXcQ",
+            stream_type=StreamType.CUSTOM,
+            path="https://stream.example/audio",
+            data={"cache_path": str(cache_path)},
+        )
+        stream = provider.get_audio_stream(details)
+        assert await anext(stream) == payload
+        await stream.aclose()
+        return cache_path
+
+    cache_path = asyncio.run(consume_then_close())
+    assert cache_path.read_bytes() == payload
+    assert not cache_path.with_suffix(".webm.part").exists()
 
 
 def test_auth_user_entry_is_cookie_only_and_defaults_to_zero():

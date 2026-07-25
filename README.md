@@ -243,9 +243,12 @@ and are not cached because the player intentionally stops before the upstream
 file is complete.
 
 Cache names are SHA-256 hashes of YouTube video IDs. Temporary files end in
-`.part`; they are never treated as cache hits. Cache eviction is intentionally
-operator-managed in this first version so the provider never silently deletes
-media from limited-bandwidth installations.
+`.part`; they are never treated as cache hits. If Music Assistant closes the
+stream immediately after its final chunk, the provider verifies the exact
+downloaded byte count before atomically promoting that file into the cache.
+Completed files are not cleared when Music Assistant or its container restarts.
+Cache eviction is intentionally operator-managed so the provider never silently
+deletes media from limited-bandwidth installations.
 
 ### Adding an arbitrary YouTube link
 
