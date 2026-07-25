@@ -114,6 +114,7 @@ CONF_AUTH_USER = "auth_user"
 CONF_PREFER_AUDIO_QUALITY = "prefer_audio_quality"
 CONF_CACHE_ENABLED = "cache_enabled"
 CONF_CACHE_DIRECTORY = "cache_directory"
+CONF_CACHE_DURING_PLAYBACK = "cache_during_playback"
 CONF_PREFETCH_ENABLED = "prefetch_enabled"
 CONF_PREFETCH_PLAYLISTS = "prefetch_playlists"
 CONF_PREFETCH_INTERVAL = "prefetch_interval_hours"
@@ -360,6 +361,18 @@ async def get_config_entries(
             "on storage that survives Music Assistant restarts.",
         ),
         ConfigEntry(
+            key=CONF_CACHE_DURING_PLAYBACK,
+            type=ConfigEntryType.BOOLEAN,
+            label="Cache during playback (unsafe compatibility mode)",
+            default_value=False,
+            required=False,
+            depends_on=CONF_CACHE_ENABLED,
+            depends_on_value=[True],
+            description="Legacy mode that tees foreground playback into the cache. Keep "
+            "disabled: Music Assistant may reopen preloaded streams while a file is "
+            "published, which can interrupt playback. Use background prefetch instead.",
+        ),
+        ConfigEntry(
             key=CONF_PREFETCH_ENABLED,
             type=ConfigEntryType.BOOLEAN,
             label="Prefetch library to cache",
@@ -433,6 +446,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
     _authenticated: bool = False
     _auth_lapse_warned: bool = False
     _cache_enabled: bool = True
+    _cache_during_playback: bool = False
     _cache_directory: str = DEFAULT_CACHE_DIRECTORY
     _cache_writers: set[str]
     _prefetch_task_id: str
@@ -457,6 +471,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
         self._prefer_quality = True if prefer_quality is None else bool(prefer_quality)
         cache_enabled = self.config.get_value(CONF_CACHE_ENABLED)
         self._cache_enabled = True if cache_enabled is None else bool(cache_enabled)
+        self._cache_during_playback = bool(
+            self.config.get_value(CONF_CACHE_DURING_PLAYBACK)
+        )
         configured_cache_directory = str(
             self.config.get_value(CONF_CACHE_DIRECTORY) or DEFAULT_CACHE_DIRECTORY
         )
@@ -1374,14 +1391,29 @@ class YoutubeMusicFreeProvider(MusicProvider):
             ),
             stream_type=(
                 StreamType.CUSTOM
-                if self._cache_enabled and start is None and end is None
+                if (
+                    self._cache_enabled
+                    and self._cache_during_playback
+                    and start is None
+                    and end is None
+                )
                 else StreamType.HTTP
             ),
             path=url,
             # A first-play cache is a single forward-only transfer. Once complete,
             # the LOCAL_FILE path above restores accurate seeking.
-            can_seek=not self._cache_enabled or start is not None or end is not None,
-            allow_seek=not self._cache_enabled or start is not None or end is not None,
+            can_seek=(
+                not self._cache_enabled
+                or not self._cache_during_playback
+                or start is not None
+                or end is not None
+            ),
+            allow_seek=(
+                not self._cache_enabled
+                or not self._cache_during_playback
+                or start is not None
+                or end is not None
+            ),
             expiration=expiration,
             data={
                 "http_headers": stream_format.get("http_headers") or {},
@@ -1436,34 +1468,12 @@ class YoutubeMusicFreeProvider(MusicProvider):
         cache_path = str(
             data.get("cache_path") or self._cache_path(streamdetails.item_id, "audio")
         )
-        # Music Assistant can resolve and preload StreamDetails before the prior
-        # play finishes. By the time this generator starts, that prior request may
-        # already have published the completed file. Recheck the exact target here
-        # so stale details do not open a new .part and download the track again.
-        cached_reader = None
-        if os.path.isfile(cache_path):
-            with suppress(OSError):
-                cached_reader = await asyncio.to_thread(open, cache_path, "rb")
-        if cached_reader is not None:
-            self.logger.info(
-                "Playback source: Local cache; preloaded YouTube Music track=%s path=%s",
-                streamdetails.item_id,
-                cache_path,
-            )
-            data.update(
-                {
-                    "playback_source": "local_cache",
-                    "playback_source_label": "Local cache",
-                    "cache_hit": True,
-                }
-            )
-            streamdetails.data = data
-            try:
-                while chunk := await asyncio.to_thread(cached_reader.read, 64 * 1024):
-                    yield chunk
-            finally:
-                await asyncio.to_thread(cached_reader.close)
-            return
+        # Never replace an already-resolved foreground stream with a cache file
+        # that appeared after resolution. Music Assistant may hold and reopen
+        # preloaded StreamDetails; changing their source can replace the active
+        # audio buffer mid-play. Cache hits are selected only by a fresh
+        # get_stream_details call above.
+        cache_target_already_exists = os.path.isfile(cache_path)
         headers = {
             str(key): str(value)
             for key, value in (data.get("http_headers") or {}).items()
@@ -1507,15 +1517,18 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     err,
                 )
             else:
-                try:
-                    cache_file = open(partial_path, "wb")
-                except OSError as err:
-                    self.logger.warning(
-                        "Unable to open cache file %s; continuing playback without "
-                        "caching: %s",
-                        partial_path,
-                        err,
-                    )
+                if cache_target_already_exists:
+                    cache_file = None
+                else:
+                    try:
+                        cache_file = open(partial_path, "wb")
+                    except OSError as err:
+                        self.logger.warning(
+                            "Unable to open cache file %s; continuing playback without "
+                            "caching: %s",
+                            partial_path,
+                            err,
+                        )
 
             async with self.mass.http_session.get(
                 str(streamdetails.path), headers=headers

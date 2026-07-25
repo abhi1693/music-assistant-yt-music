@@ -944,6 +944,7 @@ def test_get_config_entries_returns_expected_keys():
         ytm.CONF_PREFER_AUDIO_QUALITY,
         ytm.CONF_CACHE_ENABLED,
         ytm.CONF_CACHE_DIRECTORY,
+        ytm.CONF_CACHE_DURING_PLAYBACK,
         ytm.CONF_PREFETCH_ENABLED,
         ytm.CONF_PREFETCH_PLAYLISTS,
         ytm.CONF_PREFETCH_INTERVAL,
@@ -957,7 +958,7 @@ def test_get_config_entries_returns_expected_keys():
 
 
 def test_completed_stream_is_cached_and_reused(provider, tmp_path):
-    """The first play is a single upstream transfer; the next is local."""
+    """Unsafe compatibility mode can still tee one complete foreground play."""
 
     class Content:
         async def iter_chunked(self, _size):
@@ -987,6 +988,7 @@ def test_completed_stream_is_cached_and_reused(provider, tmp_path):
     session = Session()
     provider.mass = SimpleNamespace(http_session=session)
     provider._cache_enabled = True
+    provider._cache_during_playback = True
     provider._cache_directory = str(tmp_path)
     provider._cache_writers = set()
 
@@ -1027,18 +1029,67 @@ def test_completed_stream_is_cached_and_reused(provider, tmp_path):
     assert persisted.path == cached.path
 
 
-def test_preloaded_stream_details_recheck_completed_cache(provider, tmp_path):
-    """Details resolved before publication must not redownload after publication."""
+def test_cache_miss_uses_http_when_foreground_caching_is_disabled(provider, tmp_path):
+    """Safe mode keeps cache writes completely outside foreground playback."""
+
+    provider._cache_enabled = True
+    provider._cache_during_playback = False
+    provider._cache_directory = str(tmp_path)
+
+    async def stream_format(_item_id):
+        return {
+            "url": "https://stream.example/audio",
+            "ext": "webm",
+            "audio_ext": "webm",
+            "acodec": "opus",
+        }
+
+    provider._get_stream_format = stream_format
+    details = asyncio.run(
+        provider.get_stream_details("dQw4w9WgXcQ", MediaType.TRACK)
+    )
+
+    assert details.stream_type == StreamType.HTTP
+    assert details.can_seek is True
+    assert details.allow_seek is True
+    assert details.data["playback_source"] == "youtube"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_preloaded_stream_details_never_switch_source_mid_play(provider, tmp_path):
+    """An already-resolved remote stream must not switch to a new cache file."""
 
     cache_path = tmp_path / "track.webm"
     cache_path.write_bytes(b"already cached")
 
-    class Session:
-        def get(self, _url, headers=None):
-            raise AssertionError("completed cache should prevent an upstream request")
+    class Content:
+        async def iter_chunked(self, _size):
+            yield b"resolved remote stream"
 
-    provider.mass = SimpleNamespace(http_session=Session())
+    class Response:
+        content = Content()
+        content_length = len(b"resolved remote stream")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+    class Session:
+        calls = 0
+
+        def get(self, _url, headers=None):
+            self.calls += 1
+            return Response()
+
+    session = Session()
+    provider.mass = SimpleNamespace(http_session=session)
     provider._cache_enabled = True
+    provider._cache_during_playback = True
     provider._cache_directory = str(tmp_path)
     provider._cache_writers = set()
     details = StreamDetails(
@@ -1057,10 +1108,12 @@ def test_preloaded_stream_details_recheck_completed_cache(provider, tmp_path):
     async def consume():
         return b"".join([chunk async for chunk in provider.get_audio_stream(details)])
 
-    assert asyncio.run(consume()) == b"already cached"
-    assert details.data["playback_source"] == "local_cache"
-    assert details.data["playback_source_label"] == "Local cache"
-    assert details.data["cache_hit"] is True
+    assert asyncio.run(consume()) == b"resolved remote stream"
+    assert session.calls == 1
+    assert details.data["playback_source"] == "youtube"
+    assert details.data["playback_source_label"] == "YouTube Music"
+    assert details.data["cache_hit"] is False
+    assert cache_path.read_bytes() == b"already cached"
     assert not (tmp_path / "track.webm.part").exists()
 
 

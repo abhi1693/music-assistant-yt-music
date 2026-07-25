@@ -426,4 +426,5 @@ def provider():
     instance._yt_dlp_module = None
     instance._prefer_quality = True
     instance._authenticated = False
+    instance._cache_during_playback = False
     return instance
