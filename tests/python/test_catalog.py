@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from ytmusic_free.catalog import CacheJob, PostgresCacheCatalog
+from ytmusic_free.catalog import CacheJob, CachedEntry, PostgresCacheCatalog
 
 
 class FakePool:
@@ -71,12 +71,28 @@ def test_enqueue_is_instance_scoped_and_idempotent():
 
 def test_claim_uses_skip_locked_and_returns_attempt_count():
     pool = FakePool()
-    pool.claim_rows = [{"track_id": "first", "attempt_count": 3}]
+    pool.claim_rows = [
+        {
+            "track_id": "first",
+            "attempt_count": 3,
+            "upgrade_requested": True,
+            "bitrate": 128,
+            "cache_path": "/cache/first.webm",
+        }
+    ]
     catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
 
     jobs = asyncio.run(catalog.claim(10))
 
-    assert jobs == [CacheJob("first", 3)]
+    assert jobs == [
+        CacheJob(
+            "first",
+            3,
+            quality_upgrade=True,
+            cached_bitrate=128,
+            cache_path="/cache/first.webm",
+        )
+    ]
     query, args = pool.calls[0]
     assert "FOR UPDATE SKIP LOCKED" in query
     assert "lease_until" in query
@@ -98,6 +114,55 @@ def test_reconcile_imports_completed_files_as_cached():
     assert rows == (
         ("ytmusic_free--home", "track", "/cache/track.webm", 1234, "webm"),
     )
+    assert "upgrade_requested" in query
+
+
+def test_list_cached_returns_rows_that_must_have_files():
+    pool = FakePool()
+    pool.claim_rows = [
+        {
+            "track_id": "track",
+            "cache_path": "/cache/track.webm",
+            "bitrate": 138,
+        }
+    ]
+    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+
+    rows = asyncio.run(catalog.list_cached())
+
+    assert rows == [CachedEntry("track", "/cache/track.webm", 138)]
+    query, args = pool.calls[0]
+    assert "status = 'cached' OR upgrade_requested" in query
+    assert args == ("ytmusic_free--home",)
+
+
+def test_missing_cache_files_are_requeued_and_metadata_is_cleared():
+    pool = FakePool()
+    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+
+    asyncio.run(catalog.requeue_missing(["first", "second"]))
+
+    query, args = pool.calls[0]
+    assert "status = 'pending'" in query
+    assert "cache_path = NULL" in query
+    assert "upgrade_requested = false" in query
+    assert args == ("ytmusic_free--home", ["first", "second"])
+
+
+def test_quality_upgrade_scheduler_is_bounded_and_cooled_down():
+    pool = FakePool()
+    pool.claim_rows = [{"track_id": "first"}]
+    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+
+    count = asyncio.run(catalog.schedule_quality_upgrades(256, 100, 30))
+
+    assert count == 1
+    query, args = pool.calls[0]
+    assert "bitrate IS NULL OR bitrate < $2" in query
+    assert "quality_checked_at" in query
+    assert "upgrade_requested = true" in query
+    assert "FOR UPDATE SKIP LOCKED" in query
+    assert args == ("ytmusic_free--home", 256, 100, 30)
 
 
 def test_retry_records_sanitized_error_and_bounded_delay():

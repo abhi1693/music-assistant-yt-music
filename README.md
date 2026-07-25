@@ -128,7 +128,7 @@ disabled:
 
 ```sh
 curl -fsSL \
-  https://raw.githubusercontent.com/abhi1693/music-assistant-yt-music/main/scripts/install_provider.sh \
+  https://raw.githubusercontent.com/abhi1693/music-assistant-yt-music/master/scripts/install_provider.sh \
   | sh -s -- --repo-owner abhi1693
 ```
 
@@ -136,7 +136,7 @@ Upgrade an existing installation with:
 
 ```sh
 curl -fsSL \
-  https://raw.githubusercontent.com/abhi1693/music-assistant-yt-music/main/scripts/install_provider.sh \
+  https://raw.githubusercontent.com/abhi1693/music-assistant-yt-music/master/scripts/install_provider.sh \
   | sh -s -- --repo-owner abhi1693 --force
 ```
 
@@ -163,7 +163,7 @@ Watcher local add-on reinjects the provider when that happens:
 
 ```sh
 curl -fsSL \
-  https://raw.githubusercontent.com/abhi1693/music-assistant-yt-music/main/scripts/install_watcher_addon.sh \
+  https://raw.githubusercontent.com/abhi1693/music-assistant-yt-music/master/scripts/install_watcher_addon.sh \
   | sh -s -- --repo-owner abhi1693
 ```
 
@@ -223,6 +223,9 @@ name without changing its internal `ytmusic_free` domain.
 | Maximum cache size | 50 GB | Stops prefetch without evicting completed files; `0` disables the limit |
 | Pause prefetch while players are active | Disabled | Optional bandwidth protection; downloads continue during playback by default |
 | Delay between prefetch requests | 15 seconds | Protects the authenticated session from bulk-request bot challenges |
+| Upgrade lower-quality cached files | Enabled | Replaces an old cache file only after a strictly better accessible format is complete |
+| Cached quality target | 256 kbps | Checks files below this bitrate, including legacy entries with unknown bitrate |
+| Quality recheck interval | 30 days | Prevents repeated YouTube probes when the current file is already the best accessible format |
 
 ## Optional account authentication
 
@@ -299,8 +302,13 @@ transcoding them. Music Assistant may decode that input to PCM, apply processing
 such as volume normalization, and encode or transmit a player-compatible output;
 that processing view does not mean the cached WebM file was converted to PCM.
 
-Existing cached tracks keep the quality they had when first downloaded. Changing
-the quality option does not silently delete or replace them.
+With PostgreSQL and background prefetch enabled, the provider records the
+selected bitrate. Cached tracks below the configurable target, and legacy rows
+whose bitrate is unknown, are periodically checked against the best format the
+current authenticated account can access. A replacement is published only when
+its bitrate is strictly higher. The old completed file remains available during
+the download and is removed only after the replacement has been atomically
+published.
 
 ## Persistent stream cache
 
@@ -316,8 +324,12 @@ by persistent storage if it should survive container replacement.
 3. yt-dlp retains an interrupted `<track-hash>.<extension>.part` in staging.
 4. A completed stage is copied to a destination `.part` file, flushed, and
    atomically renamed within the cache filesystem.
-5. Later plays return the completed local-file stream.
-6. Preloaded requests recheck disk before opening YouTube.
+5. PostgreSQL cache rows are reconciled with the entire provider cache directory;
+   a row whose completed file vanished is cleared and requeued automatically.
+6. Eligible lower-quality files are replaced atomically after a better download
+   completes.
+7. Later plays return the completed local-file stream.
+8. Preloaded requests recheck disk before opening YouTube.
 
 The filename is a SHA-256 hash of the YouTube video ID. The extension reflects
 the selected upstream container, commonly `.webm` for Opus.
@@ -327,14 +339,16 @@ Completed cache files:
 - Survive Music Assistant and container restarts when the directory is
   persistent
 - Are never automatically evicted
-- Are never silently replaced because the quality preference changed
+- Are replaced only by the explicit, configurable quality-upgrade workflow
 - Restore seeking on subsequent plays
 
 Music Assistant can continue playing after an active cache file is deleted
 because its decoder may already hold an open file descriptor and a decoded audio
 buffer. Cached local stream details expire immediately, so once that active
 buffer is no longer reusable, Music Assistant asks the provider to check disk
-again and a missing file is downloaded normally.
+again. At the start of the next background run, PostgreSQL rows marked `cached`
+are compared with disk; a missing file becomes a pending priority job and is
+downloaded again without resetting the database.
 
 Partial files:
 
@@ -374,20 +388,25 @@ Each run:
 
 1. Enumerates authenticated library tracks.
 2. Optionally enumerates tracks from library playlists.
-3. Skips completed cache entries.
-4. Claims one PostgreSQL job at a time so a newly requested cache miss can
+3. Reconciles all PostgreSQL cache hits with completed files on disk and
+   requeues stale rows.
+4. Schedules cooled-down quality checks for cached files below the configured
+   bitrate target.
+5. Claims one PostgreSQL job at a time so a newly requested cache miss can
    move ahead of untouched bulk-library work.
-5. Downloads at most the configured number of new tracks, sequentially.
-6. Uses yt-dlp's resumable, chunked downloader, the provider's audio-quality
+6. Downloads or upgrades at most the configured number of tracks, sequentially.
+7. Uses yt-dlp's resumable, chunked downloader, the provider's audio-quality
    selector, local staging, and atomic cache publication.
-7. Stops at the configured cache-size ceiling without deleting existing files.
-8. Pauses when foreground playback is active when that protection is enabled.
+8. Stops at the configured cache-size ceiling without deleting existing files.
+9. Pauses when foreground playback is active when that protection is enabled.
 
 Without a catalog DSN, completed cache files remain the durable task state and
 the next execution rescans the library. With a PostgreSQL DSN, the provider
 also persists pending, downloading, retry, failed, and cached states. Workers
 claim jobs using `FOR UPDATE SKIP LOCKED` and a 15-minute lease. Failures use
-bounded exponential backoff and become terminal after ten attempts.
+bounded exponential backoff and become terminal after ten attempts. Cache rows
+also store bitrate, upgrade intent, and the last quality-check time so an
+unavailable higher format is not probed on every run.
 An uncached track requested for playback is inserted at priority zero; ordinary
 library inventory uses priority 100. Playback still uses its normal remote
 stream immediately and does not wait for the background download.
@@ -500,8 +519,10 @@ direct stream and are not cached.
 - Keep **Prefer highest audio quality** enabled.
 - Inspect the input codec and bitrate in Music Assistant's stream details.
 - Remember that “best” is limited to formats YouTube exposes to the extractor.
-- Existing cached files are reused; changing the preference does not redownload
-  them.
+- With PostgreSQL prefetch enabled, keep **Upgrade lower-quality cached files**
+  enabled and set **Cached quality target** to the floor you want.
+- An old or unknown-quality file is checked at most once per configured recheck
+  interval unless it is deleted and requeued.
 
 ### Authentication fails
 

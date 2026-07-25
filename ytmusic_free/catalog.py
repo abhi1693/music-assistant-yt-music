@@ -16,6 +16,18 @@ class CacheJob:
 
     track_id: str
     attempt_count: int
+    quality_upgrade: bool = False
+    cached_bitrate: int | None = None
+    cache_path: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CachedEntry:
+    """One catalog row that is expected to have a completed file."""
+
+    track_id: str
+    cache_path: str | None
+    bitrate: int | None
 
 
 class PostgresCacheCatalog:
@@ -80,6 +92,8 @@ class PostgresCacheCatalog:
                         last_error text,
                         cached_at timestamptz,
                         last_accessed_at timestamptz,
+                        upgrade_requested boolean NOT NULL DEFAULT false,
+                        quality_checked_at timestamptz,
                         created_at timestamptz NOT NULL DEFAULT now(),
                         updated_at timestamptz NOT NULL DEFAULT now(),
                         PRIMARY KEY (provider_instance_id, track_id)
@@ -202,6 +216,38 @@ class PostgresCacheCatalog:
                     """
                     INSERT INTO ytmusic_cache_schema (version)
                     VALUES (3)
+                    ON CONFLICT (version) DO NOTHING
+                    """
+                )
+                await connection.execute(
+                    """
+                    ALTER TABLE ytmusic_cache_entries
+                    ADD COLUMN IF NOT EXISTS upgrade_requested boolean
+                        NOT NULL DEFAULT false
+                    """
+                )
+                await connection.execute(
+                    """
+                    ALTER TABLE ytmusic_cache_entries
+                    ADD COLUMN IF NOT EXISTS quality_checked_at timestamptz
+                    """
+                )
+                await connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS ytmusic_cache_entries_quality_idx
+                    ON ytmusic_cache_entries (
+                        provider_instance_id,
+                        status,
+                        quality_checked_at,
+                        bitrate
+                    )
+                    WHERE status = 'cached'
+                    """
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO ytmusic_cache_schema (version)
+                    VALUES (4)
                     ON CONFLICT (version) DO NOTHING
                     """
                 )
@@ -394,7 +440,7 @@ class PostgresCacheCatalog:
     async def reconcile_cached(
         self, entries: list[tuple[str, str, int, str]]
     ) -> None:
-        """Import completed filesystem entries without changing attempt history."""
+        """Import completed files without cancelling an in-flight quality upgrade."""
 
         if not entries:
             return
@@ -409,9 +455,21 @@ class PostgresCacheCatalog:
             SET cache_path = EXCLUDED.cache_path,
                 size_bytes = EXCLUDED.size_bytes,
                 audio_format = EXCLUDED.audio_format,
-                status = 'cached',
-                lease_until = NULL,
-                last_error = NULL,
+                status = CASE
+                    WHEN ytmusic_cache_entries.upgrade_requested
+                    THEN ytmusic_cache_entries.status
+                    ELSE 'cached'
+                END,
+                lease_until = CASE
+                    WHEN ytmusic_cache_entries.upgrade_requested
+                    THEN ytmusic_cache_entries.lease_until
+                    ELSE NULL
+                END,
+                last_error = CASE
+                    WHEN ytmusic_cache_entries.upgrade_requested
+                    THEN ytmusic_cache_entries.last_error
+                    ELSE NULL
+                END,
                 cached_at = COALESCE(ytmusic_cache_entries.cached_at, now()),
                 updated_at = now()
             """,
@@ -420,6 +478,105 @@ class PostgresCacheCatalog:
                 for track_id, path, size, audio_format in entries
             ],
         )
+
+    async def list_cached(self) -> list[CachedEntry]:
+        """Return every catalog row whose completed file must still exist."""
+
+        rows = await self._pool.fetch(
+            """
+            SELECT track_id, cache_path, bitrate
+            FROM ytmusic_cache_entries
+            WHERE provider_instance_id = $1
+              AND (status = 'cached' OR upgrade_requested)
+            ORDER BY track_id
+            """,
+            self._provider_instance_id,
+        )
+        return [
+            CachedEntry(
+                track_id=str(row["track_id"]),
+                cache_path=str(row["cache_path"]) if row["cache_path"] else None,
+                bitrate=int(row["bitrate"]) if row["bitrate"] is not None else None,
+            )
+            for row in rows
+        ]
+
+    async def requeue_missing(self, track_ids: list[str]) -> None:
+        """Make catalog hits claimable again after their files disappear."""
+
+        if not track_ids:
+            return
+        await self._pool.execute(
+            """
+            UPDATE ytmusic_cache_entries
+            SET cache_path = NULL,
+                audio_format = NULL,
+                bitrate = NULL,
+                size_bytes = NULL,
+                status = 'pending',
+                priority = LEAST(priority, 10),
+                next_attempt_at = now(),
+                lease_until = NULL,
+                last_error = 'cached file missing from filesystem',
+                cached_at = NULL,
+                last_accessed_at = NULL,
+                upgrade_requested = false,
+                quality_checked_at = NULL,
+                updated_at = now()
+            WHERE provider_instance_id = $1
+              AND track_id = ANY($2::text[])
+              AND (status = 'cached' OR upgrade_requested)
+            """,
+            self._provider_instance_id,
+            track_ids,
+        )
+
+    async def schedule_quality_upgrades(
+        self,
+        target_bitrate: int,
+        limit: int,
+        recheck_days: int,
+    ) -> int:
+        """Queue stale or unknown lower-quality files for a best-format probe."""
+
+        if target_bitrate <= 0 or limit <= 0:
+            return 0
+        rows = await self._pool.fetch(
+            """
+            WITH candidates AS (
+                SELECT provider_instance_id, track_id
+                FROM ytmusic_cache_entries
+                WHERE provider_instance_id = $1
+                  AND status = 'cached'
+                  AND (bitrate IS NULL OR bitrate < $2)
+                  AND (
+                      quality_checked_at IS NULL
+                      OR quality_checked_at
+                          <= now() - ($4 * interval '1 day')
+                  )
+                ORDER BY quality_checked_at NULLS FIRST, cached_at, created_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT $3
+            )
+            UPDATE ytmusic_cache_entries AS entry
+            SET status = 'pending',
+                priority = LEAST(entry.priority, 50),
+                next_attempt_at = now(),
+                lease_until = NULL,
+                last_error = 'checking for a higher-quality format',
+                upgrade_requested = true,
+                updated_at = now()
+            FROM candidates
+            WHERE entry.provider_instance_id = candidates.provider_instance_id
+              AND entry.track_id = candidates.track_id
+            RETURNING entry.track_id
+            """,
+            self._provider_instance_id,
+            target_bitrate,
+            limit,
+            max(1, recheck_days),
+        )
+        return len(rows)
 
     async def claim(self, limit: int) -> list[CacheJob]:
         """Atomically lease eligible jobs for this provider instance."""
@@ -452,12 +609,24 @@ class PostgresCacheCatalog:
             FROM candidates
             WHERE entry.provider_instance_id = candidates.provider_instance_id
               AND entry.track_id = candidates.track_id
-            RETURNING entry.track_id, entry.attempt_count
+            RETURNING entry.track_id, entry.attempt_count,
+                entry.upgrade_requested, entry.bitrate, entry.cache_path
             """,
             self._provider_instance_id,
             limit,
         )
-        return [CacheJob(str(row["track_id"]), int(row["attempt_count"])) for row in rows]
+        return [
+            CacheJob(
+                track_id=str(row["track_id"]),
+                attempt_count=int(row["attempt_count"]),
+                quality_upgrade=bool(row["upgrade_requested"]),
+                cached_bitrate=(
+                    int(row["bitrate"]) if row["bitrate"] is not None else None
+                ),
+                cache_path=str(row["cache_path"]) if row["cache_path"] else None,
+            )
+            for row in rows
+        ]
 
     async def set_cooldown(self, seconds: int, reason: str) -> None:
         """Durably stop claims while an upstream-wide challenge is active."""
@@ -505,6 +674,8 @@ class PostgresCacheCatalog:
                 last_error = NULL,
                 cached_at = now(),
                 last_accessed_at = now(),
+                upgrade_requested = false,
+                quality_checked_at = now(),
                 updated_at = now()
             """,
             self._provider_instance_id,
@@ -515,6 +686,31 @@ class PostgresCacheCatalog:
             size_bytes,
         )
         await self._record_attempt(track_id, "cached", None)
+
+    async def mark_quality_current(
+        self,
+        track_id: str,
+        observed_bitrate: int | None,
+    ) -> None:
+        """Finish an upgrade probe that found no better accessible format."""
+
+        await self._pool.execute(
+            """
+            UPDATE ytmusic_cache_entries
+            SET bitrate = COALESCE(bitrate, $3),
+                status = 'cached',
+                lease_until = NULL,
+                last_error = NULL,
+                upgrade_requested = false,
+                quality_checked_at = now(),
+                updated_at = now()
+            WHERE provider_instance_id = $1 AND track_id = $2
+            """,
+            self._provider_instance_id,
+            track_id,
+            observed_bitrate,
+        )
+        await self._record_attempt(track_id, "quality-current", None)
 
     async def mark_retry(self, track_id: str, error: str, attempt_count: int) -> None:
         """Release a failed job with bounded exponential backoff."""

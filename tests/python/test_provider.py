@@ -957,6 +957,9 @@ def test_get_config_entries_returns_expected_keys():
         ytm.CONF_PREFETCH_MAX_CACHE_GB,
         ytm.CONF_PREFETCH_PAUSE_PLAYBACK,
         ytm.CONF_PREFETCH_REQUEST_DELAY,
+        ytm.CONF_CACHE_UPGRADE_ENABLED,
+        ytm.CONF_CACHE_UPGRADE_TARGET_BITRATE,
+        ytm.CONF_CACHE_UPGRADE_RECHECK_DAYS,
     ]
     cookie_entry = next(e for e in entries if e.key == ytm.CONF_COOKIE)
     assert cookie_entry.depends_on == ytm.CONF_AUTH_TYPE
@@ -1034,6 +1037,7 @@ def test_prefetch_downloads_library_tracks_with_native_progress(provider, tmp_pa
         ytm.CONF_PREFETCH_MAX_TRACKS: 100,
         ytm.CONF_PREFETCH_MAX_CACHE_GB: 50,
         ytm.CONF_PREFETCH_PAUSE_PLAYBACK: True,
+        ytm.CONF_PREFETCH_REQUEST_DELAY: 0,
     }
 
     class Tasks:
@@ -1056,9 +1060,18 @@ def test_prefetch_downloads_library_tracks_with_native_progress(provider, tmp_pa
 
     downloaded = []
 
-    async def prefetch_track(video_id, cache_size, cache_limit, pause):
+    async def prefetch_track(
+        video_id,
+        cache_size,
+        cache_limit,
+        pause,
+        quality_upgrade,
+        cached_bitrate,
+    ):
         downloaded.append((video_id, cache_size, cache_limit, pause))
-        return ("downloaded", 1024)
+        assert quality_upgrade is False
+        assert cached_bitrate is None
+        return ("downloaded", 1024, 256)
 
     provider.mass = SimpleNamespace(tasks=Tasks(), players=[])
     provider.config = SimpleNamespace(get_value=lambda key: values.get(key))
@@ -1076,7 +1089,7 @@ def test_prefetch_downloads_library_tracks_with_native_progress(provider, tmp_pa
     assert downloaded[0][3] is True
     assert provider.mass.tasks.progress[-1] == (
         100,
-        "Downloaded 2, skipped 0, failed 0",
+        "Downloaded 2, upgraded 0, current 0, skipped 0, failed 0",
     )
 
 
@@ -1112,6 +1125,46 @@ def test_prefetch_enqueues_durable_catalog_candidates(provider, tmp_path):
     assert candidates == ["first-video", "second-video"]
     assert provider._cache_catalog.enqueued == ["first-video", "second-video"]
     assert provider._catalog_claim_attempts == {}
+
+
+def test_catalog_reconciliation_requeues_missing_files(provider, tmp_path):
+    """A stale PostgreSQL cache hit must become claimable without a DB reset."""
+
+    from ytmusic_free.catalog import CachedEntry
+
+    existing_id = "existing-video"
+    missing_id = "missing-video"
+    existing_path = (
+        tmp_path / f"{hashlib.sha256(existing_id.encode()).hexdigest()}.webm"
+    )
+    existing_path.write_bytes(b"audio")
+
+    class Catalog:
+        reconciled = []
+        requeued = []
+
+        async def list_cached(self):
+            return [
+                CachedEntry(existing_id, str(existing_path), 138),
+                CachedEntry(missing_id, str(tmp_path / "gone.webm"), 138),
+            ]
+
+        async def reconcile_cached(self, entries):
+            self.reconciled = list(entries)
+
+        async def requeue_missing(self, track_ids):
+            self.requeued = list(track_ids)
+
+    provider._cache_directory = str(tmp_path)
+    provider._cache_catalog = Catalog()
+
+    count = asyncio.run(provider._reconcile_catalog_files())
+
+    assert count == 1
+    assert provider._cache_catalog.requeued == [missing_id]
+    assert provider._cache_catalog.reconciled == [
+        (existing_id, str(existing_path), 5, "webm")
+    ]
 
 
 def test_requested_cache_miss_receives_demand_priority(provider):
@@ -1155,7 +1208,7 @@ def test_catalog_prefetch_claims_only_one_job_at_a_time(provider, tmp_path):
         downloaded.append(video_id)
         cache_file = tmp_path / f"{hashlib.sha256(video_id.encode()).hexdigest()}.webm"
         cache_file.write_bytes(b"audio")
-        return ("downloaded", 5)
+        return ("downloaded", 5, 256)
 
     values = {
         ytm.CONF_PREFETCH_MAX_TRACKS: 100,
@@ -1226,7 +1279,7 @@ def test_catalog_prefetch_progress_never_exceeds_one_hundred(provider, tmp_path)
     async def prefetch_track(video_id, *_args):
         cache_file = tmp_path / f"{hashlib.sha256(video_id.encode()).hexdigest()}.webm"
         cache_file.write_bytes(b"audio")
-        return ("downloaded", 5)
+        return ("downloaded", 5, 256)
 
     provider._prefetch_track = prefetch_track
 
@@ -1322,7 +1375,7 @@ def test_prefetch_track_atomically_publishes_completed_audio(provider, tmp_path)
     provider._yt_dlp_module = SimpleNamespace(YoutubeDL=YoutubeDL)
     provider._get_stream_format = stream_format
 
-    result, added_bytes = asyncio.run(
+    result, added_bytes, bitrate = asyncio.run(
         provider._prefetch_track(
             "prefetch-video",
             cache_size=0,
@@ -1333,6 +1386,7 @@ def test_prefetch_track_atomically_publishes_completed_audio(provider, tmp_path)
 
     assert result == "downloaded"
     assert added_bytes == len(payload)
+    assert bitrate is None
     files = list(cache_dir.iterdir())
     assert len(files) == 1
     assert files[0].suffix == ".webm"
@@ -1342,6 +1396,108 @@ def test_prefetch_track_atomically_publishes_completed_audio(provider, tmp_path)
     assert observed_options["continuedl"] is True
     assert observed_options["http_chunk_size"] == 10 * 1024 * 1024
     assert "format" not in observed_options
+
+
+def test_prefetch_atomically_replaces_lower_quality_cache(provider, tmp_path):
+    """A lower-bitrate file stays present until the better file is complete."""
+
+    cache_dir = tmp_path / "cache"
+    staging_dir = tmp_path / "staging"
+    cache_dir.mkdir()
+    video_id = "quality-video"
+    old_path = cache_dir / f"{hashlib.sha256(video_id.encode()).hexdigest()}.webm"
+    old_path.write_bytes(b"old")
+    observed_old_during_download = []
+
+    class YoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def process_ie_result(self, info, download):
+            assert download is True
+            observed_old_during_download.append(old_path.read_bytes())
+            Path(self.options["outtmpl"]).write_bytes(b"better audio")
+            return info
+
+    async def stream_format(_video_id):
+        return {
+            "url": "https://stream.example/better",
+            "audio_ext": "m4a",
+            "format_id": "141",
+            "abr": 257.6,
+        }
+
+    provider.mass = SimpleNamespace(players=[])
+    provider._cache_directory = str(cache_dir)
+    provider._cache_staging_directory = str(staging_dir)
+    provider._cache_writers = set()
+    provider._yt_dlp_module = SimpleNamespace(YoutubeDL=YoutubeDL)
+    provider._get_stream_format = stream_format
+
+    result, size_delta, bitrate = asyncio.run(
+        provider._prefetch_track(
+            video_id,
+            cache_size=3,
+            cache_limit=1024 * 1024,
+            pause_during_playback=False,
+            quality_upgrade=True,
+            cached_bitrate=138,
+        )
+    )
+
+    assert result == "upgraded"
+    assert size_delta == len(b"better audio") - len(b"old")
+    assert bitrate == 258
+    assert observed_old_during_download == [b"old"]
+    assert not old_path.exists()
+    assert provider._find_cached_path(video_id).endswith(".m4a")
+    assert Path(provider._find_cached_path(video_id)).read_bytes() == b"better audio"
+
+
+def test_quality_probe_keeps_cache_when_accessible_format_is_not_better(
+    provider,
+    tmp_path,
+):
+    """A quality check does not redownload or replace an equal/lower format."""
+
+    video_id = "already-best"
+    cache_path = tmp_path / f"{hashlib.sha256(video_id.encode()).hexdigest()}.webm"
+    cache_path.write_bytes(b"current audio")
+
+    async def stream_format(_video_id):
+        return {
+            "url": "https://stream.example/current",
+            "audio_ext": "webm",
+            "format_id": "251",
+            "abr": 138,
+        }
+
+    provider.mass = SimpleNamespace(players=[])
+    provider._cache_directory = str(tmp_path)
+    provider._cache_staging_directory = str(tmp_path / "staging")
+    provider._cache_writers = set()
+    provider._get_stream_format = stream_format
+
+    result = asyncio.run(
+        provider._prefetch_track(
+            video_id,
+            cache_size=len(b"current audio"),
+            cache_limit=1024 * 1024,
+            pause_during_playback=False,
+            quality_upgrade=True,
+            cached_bitrate=138,
+        )
+    )
+
+    assert result == ("current", 0, 138)
+    assert cache_path.read_bytes() == b"current audio"
+    assert not Path(provider._cache_staging_directory).exists()
 
 
 def test_prefetch_uses_authenticated_headers_and_resolved_format(provider, tmp_path):
@@ -1478,7 +1634,7 @@ def test_prefetch_resumes_existing_ytdlp_partial(provider, tmp_path):
     stage = staging_dir / f"{hashlib.sha256(b'prefetch-video').hexdigest()}.webm"
     Path(f"{stage}.part").write_bytes(b"first half")
 
-    result, added_bytes = asyncio.run(
+    result, added_bytes, bitrate = asyncio.run(
         provider._prefetch_track(
             "prefetch-video",
             cache_size=0,
@@ -1489,6 +1645,7 @@ def test_prefetch_resumes_existing_ytdlp_partial(provider, tmp_path):
 
     assert result == "downloaded"
     assert added_bytes == len(b"first half second half")
+    assert bitrate is None
     assert next(cache_dir.iterdir()).read_bytes() == b"first half second half"
 
 

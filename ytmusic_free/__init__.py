@@ -129,6 +129,9 @@ CONF_PREFETCH_MAX_TRACKS = "prefetch_max_tracks"
 CONF_PREFETCH_MAX_CACHE_GB = "prefetch_max_cache_gb"
 CONF_PREFETCH_PAUSE_PLAYBACK = "prefetch_pause_playback"
 CONF_PREFETCH_REQUEST_DELAY = "prefetch_request_delay_seconds"
+CONF_CACHE_UPGRADE_ENABLED = "cache_upgrade_enabled"
+CONF_CACHE_UPGRADE_TARGET_BITRATE = "cache_upgrade_target_bitrate_kbps"
+CONF_CACHE_UPGRADE_RECHECK_DAYS = "cache_upgrade_recheck_days"
 AUTH_TYPE_NONE = "none"
 AUTH_TYPE_COOKIE = "cookie"
 DEFAULT_CACHE_DIRECTORY = "/data/ytmusic-cache"
@@ -492,6 +495,40 @@ async def get_config_entries(
             depends_on_value=[True],
             description="Paces background YouTube requests to protect the authenticated "
             "browser session from bot challenges. Foreground playback is not delayed.",
+        ),
+        ConfigEntry(
+            key=CONF_CACHE_UPGRADE_ENABLED,
+            type=ConfigEntryType.BOOLEAN,
+            label="Upgrade lower-quality cached files",
+            default_value=True,
+            required=False,
+            depends_on=CONF_PREFETCH_ENABLED,
+            depends_on_value=[True],
+            description="Periodically compare old or lower-bitrate cache entries with the "
+            "best format currently available to the authenticated account. A completed "
+            "file remains playable until a strictly better replacement is ready.",
+        ),
+        ConfigEntry(
+            key=CONF_CACHE_UPGRADE_TARGET_BITRATE,
+            type=ConfigEntryType.INTEGER,
+            label="Cached quality target (kbps)",
+            default_value=256,
+            required=False,
+            depends_on=CONF_CACHE_UPGRADE_ENABLED,
+            depends_on_value=[True],
+            description="Only cached files below this bitrate, or with unknown bitrate, are "
+            "periodically checked. The download still selects the highest accessible format.",
+        ),
+        ConfigEntry(
+            key=CONF_CACHE_UPGRADE_RECHECK_DAYS,
+            type=ConfigEntryType.INTEGER,
+            label="Quality recheck interval (days)",
+            default_value=30,
+            required=False,
+            depends_on=CONF_CACHE_UPGRADE_ENABLED,
+            depends_on_value=[True],
+            description="Minimum time before a cached file that already has the best "
+            "accessible format is checked again.",
         ),
     )
 
@@ -2020,6 +2057,48 @@ class YoutubeMusicFreeProvider(MusicProvider):
             await self._catalog_call("enqueue", candidates)
         return candidates
 
+    async def _reconcile_catalog_files(self) -> int:
+        """Requeue every catalog cache hit whose provider-owned file vanished."""
+
+        if self._cache_catalog is None:
+            return 0
+        cached_entries = await self._catalog_call("list_cached")
+        if not cached_entries:
+            return 0
+
+        missing: list[str] = []
+        present: list[tuple[str, str, int, str]] = []
+        for entry in cached_entries:
+            cached_path = await asyncio.to_thread(
+                self._find_cached_path,
+                entry.track_id,
+            )
+            if cached_path is None:
+                missing.append(entry.track_id)
+                continue
+            try:
+                size_bytes = await asyncio.to_thread(os.path.getsize, cached_path)
+            except OSError:
+                missing.append(entry.track_id)
+                continue
+            present.append(
+                (
+                    entry.track_id,
+                    cached_path,
+                    size_bytes,
+                    os.path.splitext(cached_path)[1].lstrip("."),
+                )
+            )
+
+        await self._catalog_call("reconcile_cached", present)
+        await self._catalog_call("requeue_missing", missing)
+        if missing:
+            self.logger.info(
+                "Requeued %s YouTube Music cache entries whose files are missing",
+                len(missing),
+            )
+        return len(missing)
+
     async def _completed_cache_size(self) -> int:
         """Return bytes occupied by completed provider cache files."""
 
@@ -2039,6 +2118,20 @@ class YoutubeMusicFreeProvider(MusicProvider):
             return total
 
         return await asyncio.to_thread(calculate)
+
+    @staticmethod
+    def _stream_bitrate_kbps(stream_format: dict[str, Any]) -> int | None:
+        """Return yt-dlp's audio bitrate metadata in whole kilobits per second."""
+
+        for key in ("abr", "tbr"):
+            value = stream_format.get(key)
+            if value is None:
+                continue
+            with suppress(TypeError, ValueError):
+                bitrate = round(float(value))
+                if bitrate > 0:
+                    return bitrate
+        return None
 
     def _download_to_staging(
         self,
@@ -2118,15 +2211,30 @@ class YoutubeMusicFreeProvider(MusicProvider):
         cache_size: int,
         cache_limit: int | None,
         pause_during_playback: bool,
-    ) -> tuple[str, int]:
-        """Download one track to the persistent cache without involving a player."""
+        quality_upgrade: bool = False,
+        cached_bitrate: int | None = None,
+    ) -> tuple[str, int, int | None]:
+        """Download or atomically upgrade one track without involving a player."""
 
-        if self._find_cached_path(video_id) is not None:
-            return ("skipped", 0)
+        existing_path = self._find_cached_path(video_id)
+        if existing_path is not None and not quality_upgrade:
+            return ("skipped", 0, None)
         if pause_during_playback and self._foreground_playback_active():
-            return ("paused", 0)
+            return ("paused", 0, None)
 
         stream_format = await self._get_stream_format(video_id)
+        selected_bitrate = self._stream_bitrate_kbps(stream_format)
+        if (
+            quality_upgrade
+            and existing_path is not None
+            and cached_bitrate is not None
+            and (
+                selected_bitrate is None
+                or selected_bitrate <= cached_bitrate
+            )
+        ):
+            return ("current", 0, selected_bitrate)
+
         audio_ext = stream_format.get("audio_ext") or stream_format.get("ext")
         if not audio_ext or str(audio_ext).lower() == "none":
             audio_ext = "m4a"
@@ -2136,21 +2244,27 @@ class YoutubeMusicFreeProvider(MusicProvider):
             self._cache_staging_directory,
             os.path.basename(cache_path),
         )
-        if os.path.isfile(cache_path) or cache_path in self._cache_writers:
-            return ("skipped", 0)
+        if video_id in self._cache_writers:
+            return ("busy", 0, selected_bitrate)
+        if os.path.isfile(cache_path) and not quality_upgrade:
+            return ("skipped", 0, selected_bitrate)
 
         completed = False
-        self._cache_writers.add(cache_path)
+        self._cache_writers.add(video_id)
         try:
+            existing_size = 0
+            if existing_path is not None:
+                with suppress(OSError):
+                    existing_size = os.path.getsize(existing_path)
             expected_size = stream_format.get("filesize") or stream_format.get(
                 "filesize_approx"
             )
             if (
                 cache_limit is not None
                 and expected_size is not None
-                and cache_size + int(expected_size) > cache_limit
+                and cache_size - existing_size + int(expected_size) > cache_limit
             ):
-                return ("limit", 0)
+                return ("limit", 0, selected_bitrate)
             try:
                 await asyncio.to_thread(
                     self._download_to_staging,
@@ -2160,27 +2274,33 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     pause_during_playback,
                 )
             except _PrefetchPaused:
-                return ("paused", 0)
+                return ("paused", 0, selected_bitrate)
             staged_size = await asyncio.to_thread(os.path.getsize, staging_path)
             if (
                 cache_limit is not None
-                and cache_size + staged_size > cache_limit
+                and cache_size - existing_size + staged_size > cache_limit
             ):
-                return ("limit", 0)
+                return ("limit", 0, selected_bitrate)
             bytes_written = await asyncio.to_thread(
                 self._publish_staged_file,
                 staging_path,
                 cache_path,
             )
+            if existing_path is not None and existing_path != cache_path:
+                with suppress(OSError):
+                    await asyncio.to_thread(os.remove, existing_path)
             completed = True
+            result = "upgraded" if existing_path is not None else "downloaded"
             self.logger.info(
-                "Prefetched YouTube Music track %s to %s",
+                "%s YouTube Music track %s at %s kbps to %s",
+                "Upgraded" if result == "upgraded" else "Prefetched",
                 video_id,
+                selected_bitrate if selected_bitrate is not None else "unknown",
                 cache_path,
             )
-            return ("downloaded", bytes_written)
+            return (result, bytes_written - existing_size, selected_bitrate)
         finally:
-            self._cache_writers.discard(cache_path)
+            self._cache_writers.discard(video_id)
             if not completed:
                 # A failed NFS publication is safe to retry from the complete
                 # local stage. Never accept its destination partial as a hit.
@@ -2211,15 +2331,35 @@ class YoutubeMusicFreeProvider(MusicProvider):
         cache_limit = (
             cache_limit_gb * 1024 * 1024 * 1024 if cache_limit_gb > 0 else None
         )
+        await self._reconcile_catalog_files()
         cache_size = await self._completed_cache_size()
         if cache_limit is not None and cache_size >= cache_limit:
             self.logger.info(
-                "Skipping YouTube Music prefetch: cache is at its %s GB limit",
+                "YouTube Music cache is at its %s GB limit; only replacements "
+                "that fit the configured limit can continue",
                 cache_limit_gb,
             )
-            return
 
         candidates = await self._prefetch_candidates(max_tracks)
+        configured_upgrade = self.config.get_value(CONF_CACHE_UPGRADE_ENABLED)
+        upgrade_enabled = (
+            True if configured_upgrade is None else bool(configured_upgrade)
+        )
+        if self._cache_catalog is not None and upgrade_enabled:
+            target_bitrate = self._config_positive_int(
+                CONF_CACHE_UPGRADE_TARGET_BITRATE,
+                256,
+            )
+            recheck_days = self._config_positive_int(
+                CONF_CACHE_UPGRADE_RECHECK_DAYS,
+                30,
+            )
+            await self._catalog_call(
+                "schedule_quality_upgrades",
+                target_bitrate,
+                max_tracks,
+                recheck_days,
+            )
         if not candidates and self._cache_catalog is None:
             self.mass.tasks.update_current_task_progress(
                 100, "All selected YouTube Music tracks are cached"
@@ -2228,6 +2368,8 @@ class YoutubeMusicFreeProvider(MusicProvider):
             return
 
         downloaded = 0
+        upgraded = 0
+        quality_current = 0
         skipped = 0
         failed = 0
         processed = 0
@@ -2242,10 +2384,14 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 job = claimed[0]
                 video_id = job.track_id
                 self._catalog_claim_attempts[video_id] = job.attempt_count
+                quality_upgrade = job.quality_upgrade
+                cached_bitrate = job.cached_bitrate
             else:
                 if processed >= len(candidates):
                     break
                 video_id = candidates[processed]
+                quality_upgrade = False
+                cached_bitrate = None
             processed += 1
             # A durable catalog may already contain eligible jobs that are not
             # part of this run's freshly enumerated candidate list. Use the
@@ -2262,11 +2408,13 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 f"Caching track {processed}/{task_total}",
             )
             try:
-                result, added_bytes = await self._prefetch_track(
+                result, size_delta, selected_bitrate = await self._prefetch_track(
                     video_id,
                     cache_size,
                     cache_limit,
                     pause_during_playback,
+                    quality_upgrade,
+                    cached_bitrate,
                 )
             except Exception as err:  # noqa: BLE001
                 failed += 1
@@ -2294,19 +2442,30 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     )
                     break
                 continue
-            if result == "downloaded":
-                downloaded += 1
-                cache_size += added_bytes
+            if result in {"downloaded", "upgraded"}:
+                if result == "downloaded":
+                    downloaded += 1
+                else:
+                    upgraded += 1
+                cache_size += size_delta
                 cached_path = self._find_cached_path(video_id)
                 if cached_path is not None:
+                    size_bytes = os.path.getsize(cached_path)
                     await self._catalog_call(
                         "mark_cached",
                         video_id,
                         cached_path,
-                        added_bytes,
+                        size_bytes,
                         os.path.splitext(cached_path)[1].lstrip("."),
-                        None,
+                        selected_bitrate,
                     )
+            elif result == "current":
+                quality_current += 1
+                await self._catalog_call(
+                    "mark_quality_current",
+                    video_id,
+                    selected_bitrate,
+                )
             elif result == "skipped":
                 skipped += 1
                 cached_path = self._find_cached_path(video_id)
@@ -2314,15 +2473,20 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     with suppress(OSError):
                         size_bytes = os.path.getsize(cached_path)
                         await self._catalog_call(
-                            "mark_cached",
-                            video_id,
-                            cached_path,
-                            size_bytes,
-                            os.path.splitext(cached_path)[1].lstrip("."),
-                            None,
+                            "reconcile_cached",
+                            [
+                                (
+                                    video_id,
+                                    cached_path,
+                                    size_bytes,
+                                    os.path.splitext(cached_path)[1].lstrip("."),
+                                )
+                            ],
                         )
                 else:
                     await self._catalog_call("release", video_id)
+            elif result == "busy":
+                await self._catalog_call("release", video_id)
             elif result == "paused":
                 await self._catalog_call("release", video_id)
                 self.logger.info(
@@ -2340,11 +2504,15 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
         self.mass.tasks.update_current_task_progress(
             100,
-            f"Downloaded {downloaded}, skipped {skipped}, failed {failed}",
+            f"Downloaded {downloaded}, upgraded {upgraded}, "
+            f"current {quality_current}, skipped {skipped}, failed {failed}",
         )
         self.logger.info(
-            "YouTube Music prefetch finished: downloaded=%s skipped=%s failed=%s",
+            "YouTube Music prefetch finished: downloaded=%s upgraded=%s "
+            "current=%s skipped=%s failed=%s",
             downloaded,
+            upgraded,
+            quality_current,
             skipped,
             failed,
         )
@@ -2382,12 +2550,19 @@ class YoutubeMusicFreeProvider(MusicProvider):
             names = os.listdir(self._cache_directory)
         except OSError:
             return None
+        candidates: list[tuple[float, str]] = []
         for name in names:
             if name.startswith(prefix) and not name.endswith(".part"):
                 candidate = os.path.join(self._cache_directory, name)
-                if os.path.isfile(candidate):
-                    return candidate
-        return None
+                with suppress(OSError):
+                    if os.path.isfile(candidate):
+                        candidates.append((os.path.getmtime(candidate), candidate))
+        if not candidates:
+            return None
+        # A quality upgrade can change containers. If removal of the old
+        # completed file is delayed by NFS, always select the newly published
+        # replacement rather than depending on directory enumeration order.
+        return max(candidates)[1]
 
     # ------------------------------------------------------------------
     # Library methods (require authentication)

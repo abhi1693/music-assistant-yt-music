@@ -2,10 +2,10 @@
   "type": "music",
   "domain": "ytmusic_free",
   "stage": "experimental",
-  "name": "YouTube Music (Free)",
+  "name": "YouTube Music",
   "description": "Stream YouTube Music and retain completed plays in a persistent local cache.",
   "codeowners": ["abhi1693"],
-  "documentation": "https://github.com/abhi1693/music-assistant-yt-music/blob/main/README.md",
+  "documentation": "https://github.com/abhi1693/music-assistant-yt-music/blob/master/README.md",
   "requirements": [
     "ytmusicapi>=1.7.0",
     "yt-dlp[default]>=2024.1.0",
