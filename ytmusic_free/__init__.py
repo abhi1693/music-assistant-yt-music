@@ -23,6 +23,7 @@ import shutil
 import time
 from collections.abc import AsyncGenerator
 from contextlib import suppress
+from http.cookiejar import Cookie
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -119,16 +120,21 @@ CONF_CACHE_ENABLED = "cache_enabled"
 CONF_CACHE_DIRECTORY = "cache_directory"
 CONF_CACHE_STAGING_DIRECTORY = "cache_staging_directory"
 CONF_CACHE_CATALOG_DSN = "cache_catalog_postgres_dsn"
+CONF_ACCOUNT_SYNC_ENABLED = "account_sync_enabled"
+CONF_ACCOUNT_SYNC_INTERVAL = "account_sync_interval_hours"
 CONF_PREFETCH_ENABLED = "prefetch_enabled"
 CONF_PREFETCH_PLAYLISTS = "prefetch_playlists"
 CONF_PREFETCH_INTERVAL = "prefetch_interval_hours"
 CONF_PREFETCH_MAX_TRACKS = "prefetch_max_tracks"
 CONF_PREFETCH_MAX_CACHE_GB = "prefetch_max_cache_gb"
 CONF_PREFETCH_PAUSE_PLAYBACK = "prefetch_pause_playback"
+CONF_PREFETCH_REQUEST_DELAY = "prefetch_request_delay_seconds"
 AUTH_TYPE_NONE = "none"
 AUTH_TYPE_COOKIE = "cookie"
 DEFAULT_CACHE_DIRECTORY = "/data/ytmusic-cache"
 DEFAULT_CACHE_STAGING_DIRECTORY = "/data/ytmusic-cache-staging"
+MIRROR_LIKED_PLAYLIST_ID = "__ytmusic_liked_songs__"
+MIRROR_HISTORY_PLAYLIST_ID = "__ytmusic_history__"
 
 
 class _PrefetchPaused(Exception):
@@ -393,6 +399,27 @@ async def get_config_entries(
             "leases, and cache metadata. Playback remains available if PostgreSQL is down.",
         ),
         ConfigEntry(
+            key=CONF_ACCOUNT_SYNC_ENABLED,
+            type=ConfigEntryType.BOOLEAN,
+            label="Mirror complete YouTube Music account",
+            default_value=True,
+            required=False,
+            description="Persist saved music, likes, artists, subscriptions, albums, "
+            "playlists, ordered membership, history, uploads, podcasts, channels, "
+            "and account metadata in PostgreSQL.",
+        ),
+        ConfigEntry(
+            key=CONF_ACCOUNT_SYNC_INTERVAL,
+            type=ConfigEntryType.INTEGER,
+            label="Account mirror interval (hours)",
+            default_value=6,
+            required=False,
+            depends_on=CONF_ACCOUNT_SYNC_ENABLED,
+            depends_on_value=[True],
+            description="How often the native Music Assistant task refreshes the "
+            "authenticated YouTube Music account snapshot.",
+        ),
+        ConfigEntry(
             key=CONF_PREFETCH_ENABLED,
             type=ConfigEntryType.BOOLEAN,
             label="Prefetch library to cache",
@@ -455,6 +482,17 @@ async def get_config_entries(
             description="Opt in to stopping background downloads during playback. "
             "Disabled by default so prefetch continues while players are active.",
         ),
+        ConfigEntry(
+            key=CONF_PREFETCH_REQUEST_DELAY,
+            type=ConfigEntryType.INTEGER,
+            label="Delay between prefetch requests (seconds)",
+            default_value=15,
+            required=False,
+            depends_on=CONF_PREFETCH_ENABLED,
+            depends_on_value=[True],
+            description="Paces background YouTube requests to protect the authenticated "
+            "browser session from bot challenges. Foreground playback is not delayed.",
+        ),
     )
 
 
@@ -474,6 +512,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
     _catalog_claim_attempts: dict[str, int]
     _prefetch_task_id: str
     _prefetch_task_registered: bool
+    _account_sync_task_id: str
+    _account_sync_task_registered: bool
+    _auth_headers: dict[str, str]
     # Per-category flag: True once we've seen a non-empty sync. Used to tell a
     # genuinely empty library apart from a partial-auth HTTP 200 response that
     # ytmusicapi unwraps to []. See issue #10.
@@ -510,6 +551,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
         self._catalog_claim_attempts = {}
         self._prefetch_task_id = f"{self.instance_id}_prefetch"
         self._prefetch_task_registered = False
+        self._account_sync_task_id = f"{self.instance_id}_account_sync"
+        self._account_sync_task_registered = False
+        self._auth_headers = {}
         if catalog_dsn := str(
             self.config.get_value(CONF_CACHE_CATALOG_DSN) or ""
         ).strip():
@@ -539,6 +583,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     auth_headers = self._build_auth_headers(
                         cookie, self._configured_auth_user()
                     )
+                    if brand_account:
+                        auth_headers["x-goog-pageid"] = str(brand_account)
+                    self._auth_headers = auth_headers
                     self._ytmusic = await asyncio.to_thread(
                         self._create_ytmusic_client, auth=auth_headers, user=brand_account
                     )
@@ -567,37 +614,59 @@ class YoutubeMusicFreeProvider(MusicProvider):
             self.logger.info("YouTube Music (Free) initialized — anonymous mode")
 
     async def loaded_in_mass(self) -> None:
-        """Register the native Music Assistant prefetch task after provider load."""
+        """Register native account-mirror and prefetch tasks after provider load."""
 
         await super().loaded_in_mass()
-        if not (
-            self._authenticated
-            and self._cache_enabled
-            and self.config.get_value(CONF_PREFETCH_ENABLED)
-        ):
+        if not self._authenticated:
             return
         if TaskSchedule is None or not hasattr(self.mass, "tasks"):
             self.logger.warning(
-                "YouTube Music prefetch requires a Music Assistant release with "
-                "native background tasks"
+                "YouTube Music account sync and prefetch require a Music Assistant "
+                "release with native background tasks"
             )
             return
-        interval = self._config_positive_int(CONF_PREFETCH_INTERVAL, 6)
-        self.mass.tasks.register_scheduled_task(
-            task_id=self._prefetch_task_id,
-            name=f"{self.name} library prefetch",
-            handler=self._run_cache_prefetch,
-            schedule=TaskSchedule.hourly(every=interval),
-            initial_delay=180,
-            metadata={
-                "provider_instance": self.instance_id,
-                "provider_domain": self.domain,
-                "operation": "cache_prefetch",
-            },
-            allow_retry=True,
-            allow_cancel=True,
-        )
-        self._prefetch_task_registered = True
+        if (
+            self._cache_catalog is not None
+            and self.config.get_value(CONF_ACCOUNT_SYNC_ENABLED) is not False
+        ):
+            account_interval = self._config_positive_int(
+                CONF_ACCOUNT_SYNC_INTERVAL, 6
+            )
+            self.mass.tasks.register_scheduled_task(
+                task_id=self._account_sync_task_id,
+                name=f"{self.name} account mirror",
+                handler=self._run_account_sync,
+                schedule=TaskSchedule.hourly(every=account_interval),
+                initial_delay=60,
+                metadata={
+                    "provider_instance": self.instance_id,
+                    "provider_domain": self.domain,
+                    "operation": "account_sync",
+                },
+                allow_retry=True,
+                allow_cancel=True,
+            )
+            self._account_sync_task_registered = True
+        if (
+            self._cache_enabled
+            and self.config.get_value(CONF_PREFETCH_ENABLED)
+        ):
+            interval = self._config_positive_int(CONF_PREFETCH_INTERVAL, 6)
+            self.mass.tasks.register_scheduled_task(
+                task_id=self._prefetch_task_id,
+                name=f"{self.name} library prefetch",
+                handler=self._run_cache_prefetch,
+                schedule=TaskSchedule.hourly(every=interval),
+                initial_delay=180,
+                metadata={
+                    "provider_instance": self.instance_id,
+                    "provider_domain": self.domain,
+                    "operation": "cache_prefetch",
+                },
+                allow_retry=True,
+                allow_cancel=True,
+            )
+            self._prefetch_task_registered = True
 
     async def unload(self, is_removed: bool = False) -> None:
         """Unregister the prefetch task and unload the provider."""
@@ -605,6 +674,11 @@ class YoutubeMusicFreeProvider(MusicProvider):
         if getattr(self, "_prefetch_task_registered", False):
             self.mass.tasks.unregister_scheduled_task(
                 self._prefetch_task_id,
+                clear_persisted_state=is_removed,
+            )
+        if getattr(self, "_account_sync_task_registered", False):
+            self.mass.tasks.unregister_scheduled_task(
+                self._account_sync_task_id,
                 clear_persisted_state=is_removed,
             )
         if catalog := getattr(self, "_cache_catalog", None):
@@ -651,6 +725,307 @@ class YoutubeMusicFreeProvider(MusicProvider):
         except (TypeError, ValueError):
             return default
         return value if value > 0 else default
+
+    @staticmethod
+    def _mirror_object_id(payload: dict[str, Any], object_type: str) -> str | None:
+        """Return the stable YouTube identifier for one mirrored object."""
+
+        keys_by_type = {
+            "track": ("videoId", "id"),
+            "album": ("browseId", "id", "audioPlaylistId"),
+            "artist": ("browseId", "channelId", "id"),
+            "playlist": ("playlistId", "id", "browseId"),
+            "podcast": ("podcastId", "browseId", "id"),
+            "episode": ("videoId", "episodeId", "id"),
+            "channel": ("browseId", "channelId", "id"),
+            "account": ("channelId", "accountName"),
+            "taste_profile": ("id", "title", "name"),
+        }
+        for key in keys_by_type.get(object_type, ("id",)):
+            if value := payload.get(key):
+                return str(value)
+        return None
+
+    def _mirror_rows(
+        self,
+        payloads: list[dict[str, Any]],
+        object_type: str,
+        *,
+        history: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Normalize API payloads into durable object/relation rows."""
+
+        rows = []
+        for position, payload in enumerate(payloads):
+            if not isinstance(payload, dict):
+                continue
+            object_id = self._mirror_object_id(payload, object_type)
+            if not object_id:
+                continue
+            if history:
+                relation_seed = (
+                    payload.get("feedbackToken")
+                    or f"{object_id}:{payload.get('played', '')}"
+                )
+                relation_key = hashlib.sha256(
+                    str(relation_seed).encode()
+                ).hexdigest()
+            else:
+                relation_key = str(
+                    payload.get("setVideoId")
+                    or payload.get("playlistItemId")
+                    or object_id
+                )
+                if any(
+                    existing["relation_key"] == relation_key for existing in rows
+                ):
+                    relation_key = f"{relation_key}:{position}"
+            rows.append(
+                {
+                    "object_type": object_type,
+                    "object_id": object_id,
+                    "relation_key": relation_key,
+                    "position": position,
+                    "payload": payload,
+                }
+            )
+        return rows
+
+    async def _replace_mirror_collection(
+        self,
+        collection: str,
+        object_type: str,
+        payloads: list[dict[str, Any]],
+        *,
+        owner_id: str = "",
+        remove_missing: bool = True,
+        cache_priority: int | None = None,
+    ) -> int:
+        """Persist one normalized collection and optionally queue its tracks."""
+
+        rows = self._mirror_rows(
+            payloads,
+            object_type,
+            history=collection == "history",
+        )
+        await self._catalog_call(
+            "replace_account_collection",
+            collection,
+            owner_id,
+            rows,
+            remove_missing,
+        )
+        if cache_priority is not None:
+            await self._catalog_call(
+                "enqueue",
+                [row["object_id"] for row in rows],
+                cache_priority,
+            )
+        return len(rows)
+
+    async def _account_api_list(
+        self,
+        method_name: str,
+        *args: Any,
+        result_key: str | None = None,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]] | None:
+        """Fetch one optional authenticated endpoint without erasing on failure."""
+
+        method = getattr(self._ytmusic, method_name, None)
+        if not callable(method):
+            self.logger.debug("ytmusicapi does not expose %s", method_name)
+            return None
+        try:
+            response = await asyncio.to_thread(method, *args, **kwargs)
+        except Exception as err:  # noqa: BLE001
+            self._warn_library_error(method_name, err)
+            return None
+        if result_key and isinstance(response, dict):
+            response = response.get(result_key)
+        if isinstance(response, dict):
+            return [response]
+        if isinstance(response, list):
+            return [item for item in response if isinstance(item, dict)]
+        return []
+
+    async def _mirrored_payloads(
+        self,
+        collection: str,
+        owner_id: str = "",
+    ) -> list[dict[str, Any]] | None:
+        """Return a completed mirror snapshot, or None before first sync."""
+
+        if self._cache_catalog is None:
+            return None
+        synced = await self._catalog_call(
+            "has_account_collection",
+            collection,
+            owner_id,
+        )
+        if not synced:
+            return None
+        rows = await self._catalog_call(
+            "get_account_collection",
+            collection,
+            owner_id,
+        )
+        if rows is None:
+            return None
+        return [
+            row["payload"]
+            for row in rows
+            if isinstance(row.get("payload"), dict)
+        ]
+
+    async def _run_account_sync(self) -> None:
+        """Mirror every authenticated YouTube Music account collection."""
+
+        if not self._authenticated or self._cache_catalog is None:
+            self.logger.info("Skipping YouTube Music account mirror: provider is not ready")
+            return
+
+        specs = (
+            ("saved_tracks", "track", "get_library_songs", {"limit": 9999}, None, 20),
+            ("liked_tracks", "track", "get_liked_songs", {"limit": 9999}, "tracks", 10),
+            ("albums", "album", "get_library_albums", {"limit": 9999}, None, None),
+            ("artists", "artist", "get_library_artists", {"limit": 9999}, None, None),
+            (
+                "subscriptions",
+                "artist",
+                "get_library_subscriptions",
+                {"limit": 9999},
+                None,
+                None,
+            ),
+            (
+                "playlists",
+                "playlist",
+                "get_library_playlists",
+                {"limit": 9999},
+                None,
+                None,
+            ),
+            ("history", "track", "get_history", {}, None, 30),
+            (
+                "upload_tracks",
+                "track",
+                "get_library_upload_songs",
+                {"limit": 9999},
+                None,
+                25,
+            ),
+            (
+                "upload_albums",
+                "album",
+                "get_library_upload_albums",
+                {"limit": 9999},
+                None,
+                None,
+            ),
+            (
+                "upload_artists",
+                "artist",
+                "get_library_upload_artists",
+                {"limit": 9999},
+                None,
+                None,
+            ),
+            (
+                "podcasts",
+                "podcast",
+                "get_library_podcasts",
+                {"limit": 9999},
+                None,
+                None,
+            ),
+            (
+                "channels",
+                "channel",
+                "get_library_channels",
+                {"limit": 9999},
+                None,
+                None,
+            ),
+            (
+                "saved_episodes",
+                "episode",
+                "get_saved_episodes",
+                {"limit": 9999},
+                "tracks",
+                None,
+            ),
+            ("account", "account", "get_account_info", {}, None, None),
+            ("taste_profile", "taste_profile", "get_tasteprofile", {}, None, None),
+        )
+        counts: dict[str, int] = {}
+        playlist_payloads: list[dict[str, Any]] | None = None
+        for index, (
+            collection,
+            object_type,
+            method_name,
+            kwargs,
+            result_key,
+            cache_priority,
+        ) in enumerate(specs, start=1):
+            self.mass.tasks.update_current_task_progress(
+                int(((index - 1) / len(specs)) * 70),
+                f"Mirroring {collection.replace('_', ' ')}",
+            )
+            payloads = await self._account_api_list(
+                method_name,
+                result_key=result_key,
+                **kwargs,
+            )
+            if payloads is None:
+                continue
+            if collection == "playlists":
+                playlist_payloads = payloads
+            counts[collection] = await self._replace_mirror_collection(
+                collection,
+                object_type,
+                payloads,
+                remove_missing=collection != "history",
+                cache_priority=cache_priority,
+            )
+
+        if playlist_payloads is not None:
+            playlist_total = max(1, len(playlist_payloads))
+            for position, playlist in enumerate(playlist_payloads, start=1):
+                playlist_id = self._mirror_object_id(playlist, "playlist")
+                if not playlist_id:
+                    continue
+                self.mass.tasks.update_current_task_progress(
+                    70 + int((position / playlist_total) * 29),
+                    f"Mirroring playlist {position}/{playlist_total}",
+                )
+                response = await self._account_api_list(
+                    "get_playlist",
+                    playlist_id,
+                    limit=None,
+                )
+                if response is None:
+                    continue
+                playlist_result = response[0] if response else {}
+                tracks = playlist_result.get("tracks") or []
+                counts[f"playlist:{playlist_id}"] = (
+                    await self._replace_mirror_collection(
+                        "playlist_tracks",
+                        "track",
+                        tracks,
+                        owner_id=playlist_id,
+                        cache_priority=40,
+                    )
+                )
+
+        self.mass.tasks.update_current_task_progress(
+            100,
+            f"Mirrored {sum(counts.values())} account relationships",
+        )
+        self.logger.info(
+            "YouTube Music account mirror completed: %s",
+            ", ".join(f"{key}={value}" for key, value in counts.items()),
+        )
 
     def _create_ytmusic_client(
         self, auth: dict[str, str] | None = None, user: str | None = None
@@ -1182,6 +1557,26 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """Get full playlist details by id."""
+        if prov_playlist_id in (MIRROR_LIKED_PLAYLIST_ID, MIRROR_HISTORY_PLAYLIST_ID):
+            name = (
+                "Liked songs"
+                if prov_playlist_id == MIRROR_LIKED_PLAYLIST_ID
+                else "Listening history"
+            )
+            return Playlist(
+                item_id=prov_playlist_id,
+                provider=self.instance_id,
+                name=name,
+                owner=self.name,
+                provider_mappings={
+                    ProviderMapping(
+                        item_id=prov_playlist_id,
+                        provider_domain=self.domain,
+                        provider_instance=self.instance_id,
+                    )
+                },
+                is_editable=False,
+            )
         try:
             playlist_obj = await asyncio.to_thread(
                 self._ytmusic.get_playlist, prov_playlist_id, limit=1
@@ -1202,6 +1597,30 @@ class YoutubeMusicFreeProvider(MusicProvider):
         """Return playlist tracks for the given playlist id."""
         if page > 0:
             return []
+        mirror_collection = {
+            MIRROR_LIKED_PLAYLIST_ID: "liked_tracks",
+            MIRROR_HISTORY_PLAYLIST_ID: "history",
+        }.get(prov_playlist_id)
+        if mirror_collection:
+            payloads = await self._mirrored_payloads(mirror_collection)
+            result = []
+            for position, item in enumerate(payloads or [], 1):
+                with suppress(InvalidDataError, KeyError, TypeError):
+                    track = self._parse_track(item)
+                    if track:
+                        track.position = position
+                        result.append(track)
+            return result
+        mirrored = await self._mirrored_payloads("playlist_tracks", prov_playlist_id)
+        if mirrored is not None:
+            result = []
+            for position, item in enumerate(mirrored, 1):
+                with suppress(InvalidDataError, KeyError, TypeError):
+                    track = self._parse_track(item)
+                    if track:
+                        track.position = position
+                        result.append(track)
+            return result
         try:
             playlist_obj = await asyncio.to_thread(
                 self._ytmusic.get_playlist, prov_playlist_id, limit=None
@@ -1639,17 +2058,10 @@ class YoutubeMusicFreeProvider(MusicProvider):
             if pause_during_playback and self._foreground_playback_active():
                 raise _PrefetchPaused
 
-        format_id = stream_format.get("format_id")
-        selector = str(format_id) if format_id else (
-            "bestaudio/best"
-            if self._prefer_quality
-            else "bestaudio[ext=m4a]/bestaudio/best"
-        )
         options = {
             "quiet": True,
             "noprogress": True,
             "no_warnings": True,
-            "format": selector,
             "outtmpl": staging_path,
             "continuedl": True,
             "nopart": False,
@@ -1660,16 +2072,29 @@ class YoutubeMusicFreeProvider(MusicProvider):
             # rotates bounded range requests when this value is set.
             "http_chunk_size": 10 * 1024 * 1024,
             "progress_hooks": [progress_hook],
-            "extractor_args": {
-                "youtube": {
-                    "skip": ["translated_subs", "dash"],
-                },
-            },
+            "http_headers": self._ytdlp_http_headers(),
         }
         os.makedirs(self._cache_staging_directory, mode=0o775, exist_ok=True)
         with self._yt_dlp_module.YoutubeDL(options) as ydl:
-            result = ydl.download([f"{YTM_DOMAIN}/watch?v={video_id}"])
-        if result not in (None, 0) or not os.path.isfile(staging_path):
+            self._load_ytdlp_cookiejar(ydl)
+            # Feed the already-resolved format directly to yt-dlp. Calling
+            # download(watch_url) would extract the same video a second time,
+            # doubling request volume and allowing format/client drift between
+            # selection and download.
+            download_info = dict(stream_format)
+            download_info.update(
+                {
+                    "id": video_id,
+                    "title": video_id,
+                    "webpage_url": f"{YTM_DOMAIN}/watch?v={video_id}",
+                    "http_headers": {
+                        **self._ytdlp_http_headers(),
+                        **(stream_format.get("http_headers") or {}),
+                    },
+                }
+            )
+            ydl.process_ie_result(download_info, download=True)
+        if not os.path.isfile(staging_path):
             raise RuntimeError("yt-dlp did not produce the staged audio file")
 
     @staticmethod
@@ -1702,7 +2127,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
             return ("paused", 0)
 
         stream_format = await self._get_stream_format(video_id)
-        audio_ext = stream_format.get("audio_ext") or stream_format.get("ext", "m4a")
+        audio_ext = stream_format.get("audio_ext") or stream_format.get("ext")
+        if not audio_ext or str(audio_ext).lower() == "none":
+            audio_ext = "m4a"
         safe_audio_ext = re.sub(r"[^a-z0-9]", "", str(audio_ext).lower()) or "audio"
         cache_path = self._cache_path(video_id, safe_audio_ext)
         staging_path = os.path.join(
@@ -1804,6 +2231,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
         skipped = 0
         failed = 0
         processed = 0
+        request_delay = self._config_nonnegative_int(
+            CONF_PREFETCH_REQUEST_DELAY, 15
+        )
         while processed < max_tracks:
             if self._cache_catalog is not None:
                 claimed = await self._catalog_call("claim", 1)
@@ -1817,8 +2247,16 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     break
                 video_id = candidates[processed]
             processed += 1
-            task_total = min(max_tracks, max(1, len(candidates)))
-            progress = int(((processed - 1) / task_total) * 100)
+            # A durable catalog may already contain eligible jobs that are not
+            # part of this run's freshly enumerated candidate list. Use the
+            # configured work bound as the denominator in that case; otherwise
+            # a short candidate list followed by older claims can emit >100%.
+            task_total = (
+                max_tracks
+                if self._cache_catalog is not None
+                else min(max_tracks, max(1, len(candidates)))
+            )
+            progress = min(99, int(((processed - 1) / task_total) * 100))
             self.mass.tasks.update_current_task_progress(
                 progress,
                 f"Caching track {processed}/{task_total}",
@@ -1844,6 +2282,17 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     video_id,
                     error_name,
                 )
+                if self._is_youtube_challenge(err):
+                    await self._catalog_call(
+                        "set_cooldown",
+                        6 * 60 * 60,
+                        "YouTube bot challenge",
+                    )
+                    self.logger.warning(
+                        "Paused YouTube Music prefetch for 6 hours after YouTube "
+                        "challenged the authenticated browser session"
+                    )
+                    break
                 continue
             if result == "downloaded":
                 downloaded += 1
@@ -1886,6 +2335,8 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     "Stopped YouTube Music prefetch at the configured cache-size limit"
                 )
                 break
+            if request_delay and processed < max_tracks:
+                await asyncio.sleep(request_delay)
 
         self.mass.tasks.update_current_task_progress(
             100,
@@ -1897,6 +2348,22 @@ class YoutubeMusicFreeProvider(MusicProvider):
             skipped,
             failed,
         )
+
+    @staticmethod
+    def _is_youtube_challenge(err: Exception) -> bool:
+        """Return whether YouTube requested interactive bot verification."""
+
+        message = str(err).lower()
+        return "not a bot" in message or "sign in to confirm" in message
+
+    def _config_nonnegative_int(self, key: str, default: int) -> int:
+        """Return a non-negative configured integer or its safe default."""
+
+        try:
+            value = int(self.config.get_value(key))
+        except (TypeError, ValueError):
+            return default
+        return value if value >= 0 else default
 
     def _cache_path(self, item_id: str, extension: str) -> str:
         """Return an instance-local, path-safe cache filename."""
@@ -2009,20 +2476,30 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
         if not self._authenticated:
             return
-        subs: list[dict] = []
-        lib_artists: list[dict] = []
-        try:
-            subs = await asyncio.to_thread(
-                self._ytmusic.get_library_subscriptions, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_subscriptions", err)
-        try:
-            lib_artists = await asyncio.to_thread(
-                self._ytmusic.get_library_artists, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_artists", err)
+        mirrored_subs = await self._mirrored_payloads("subscriptions")
+        mirrored_artists = await self._mirrored_payloads("artists")
+        mirrored_upload_artists = await self._mirrored_payloads("upload_artists")
+        if mirrored_subs is not None or mirrored_artists is not None:
+            subs = mirrored_subs or []
+            lib_artists = [
+                *(mirrored_artists or []),
+                *(mirrored_upload_artists or []),
+            ]
+        else:
+            subs: list[dict] = []
+            lib_artists: list[dict] = []
+            try:
+                subs = await asyncio.to_thread(
+                    self._ytmusic.get_library_subscriptions, limit=9999
+                ) or []
+            except Exception as err:
+                self._warn_library_error("get_library_subscriptions", err)
+            try:
+                lib_artists = await asyncio.to_thread(
+                    self._ytmusic.get_library_artists, limit=9999
+                ) or []
+            except Exception as err:
+                self._warn_library_error("get_library_artists", err)
         await self._guard_partial_auth_empty("artists", len(subs) + len(lib_artists))
         seen_ids: set[str] = set()
         for item in subs:
@@ -2047,33 +2524,55 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
         if not self._authenticated:
             return
-        try:
-            results = await asyncio.to_thread(
-                self._ytmusic.get_library_albums, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_albums", err)
-            return
+        results = await self._mirrored_payloads("albums")
+        upload_albums = await self._mirrored_payloads("upload_albums")
+        if results is not None:
+            results = [*results, *(upload_albums or [])]
+        if results is None:
+            try:
+                results = await asyncio.to_thread(
+                    self._ytmusic.get_library_albums, limit=9999
+                ) or []
+            except Exception as err:
+                self._warn_library_error("get_library_albums", err)
+                return
         await self._guard_partial_auth_empty("albums", len(results))
         for item in results:
             with suppress(InvalidDataError, KeyError, TypeError):
                 yield self._parse_album(item, item.get("browseId"))
 
     async def get_library_tracks(self) -> AsyncGenerator[Track, None]:
-        """Get tracks from the user's library."""
+        """Get the durable union of saved, liked, and listened tracks."""
 
         if not self._authenticated:
             return
-        try:
-            results = await asyncio.to_thread(
-                self._ytmusic.get_library_songs, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_songs", err)
-            return
+        results = await self._mirrored_payloads("saved_tracks")
+        liked = await self._mirrored_payloads("liked_tracks")
+        history = await self._mirrored_payloads("history")
+        uploads = await self._mirrored_payloads("upload_tracks")
+        if results is not None:
+            results = [
+                *results,
+                *(liked or []),
+                *(history or []),
+                *(uploads or []),
+            ]
+        else:
+            try:
+                results = await asyncio.to_thread(
+                    self._ytmusic.get_library_songs, limit=9999
+                ) or []
+            except Exception as err:
+                self._warn_library_error("get_library_songs", err)
+                return
         await self._guard_partial_auth_empty("tracks", len(results))
+        seen_ids: set[str] = set()
         for item in results:
             with suppress(InvalidDataError, KeyError, TypeError):
+                video_id = item.get("videoId")
+                if not video_id or video_id in seen_ids:
+                    continue
+                seen_ids.add(video_id)
                 track = self._parse_track(item)
                 if track:
                     yield track
@@ -2083,18 +2582,28 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
         if not self._authenticated:
             return
-        try:
-            results = await asyncio.to_thread(
-                self._ytmusic.get_library_playlists, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_playlists", err)
-            return
+        results = await self._mirrored_payloads("playlists")
+        if results is None:
+            try:
+                results = await asyncio.to_thread(
+                    self._ytmusic.get_library_playlists, limit=9999
+                ) or []
+            except Exception as err:
+                self._warn_library_error("get_library_playlists", err)
+                return
         await self._guard_partial_auth_empty("playlists", len(results))
         for item in results:
             with suppress(InvalidDataError, KeyError, TypeError):
                 item.setdefault("id", item.get("playlistId"))
                 yield self._parse_playlist(item)
+        for playlist_id in (MIRROR_LIKED_PLAYLIST_ID, MIRROR_HISTORY_PLAYLIST_ID):
+            collection = (
+                "liked_tracks"
+                if playlist_id == MIRROR_LIKED_PLAYLIST_ID
+                else "history"
+            )
+            if await self._mirrored_payloads(collection) is not None:
+                yield await self.get_playlist(playlist_id)
 
     async def library_add(self, item: MediaItemType) -> bool:
         """Add an item to the user's library."""
@@ -2205,7 +2714,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
     # ------------------------------------------------------------------
 
     async def _get_stream_format(self, item_id: str) -> dict[str, Any]:
-        """Extract the best audio stream URL via yt-dlp (no cookies required)."""
+        """Resolve one authenticated audio format for playback or prefetch."""
 
         prefer_quality = self._prefer_quality
         # Defensive: strip any trim suffix so yt-dlp always sees a bare video id.
@@ -2220,6 +2729,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
+                "http_headers": self._ytdlp_http_headers(),
                 # Deliberately no "player_client" pin. It is tempting to name the
                 # clients that work without an account, but no single list is valid
                 # across the yt-dlp range the manifest allows: android_vr does not
@@ -2234,6 +2744,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 },
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                self._load_ytdlp_cookiejar(ydl)
                 try:
                     info = ydl.extract_info(url, download=False)
                 except yt_dlp.utils.DownloadError as err:
@@ -2273,6 +2784,49 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 return stream_format
 
         return await asyncio.to_thread(_extract)
+
+    def _ytdlp_http_headers(self) -> dict[str, str]:
+        """Return non-cookie browser headers suitable for yt-dlp and media URLs."""
+
+        headers = {
+            str(key).title(): str(value)
+            for key, value in getattr(self, "_auth_headers", {}).items()
+            if key.lower() not in {"content-type", "authorization", "cookie"}
+        }
+        return headers
+
+    def _load_ytdlp_cookiejar(self, ydl: Any) -> None:
+        """Load the configured browser session into yt-dlp without a cookie file."""
+
+        cookie_header = getattr(self, "_auth_headers", {}).get("cookie", "")
+        cookiejar = getattr(ydl, "cookiejar", None)
+        if not cookie_header or cookiejar is None:
+            return
+        for raw_cookie in cookie_header.split(";"):
+            name, separator, value = raw_cookie.strip().partition("=")
+            if not separator or not name:
+                continue
+            cookiejar.set_cookie(
+                Cookie(
+                    version=0,
+                    name=name,
+                    value=value,
+                    port=None,
+                    port_specified=False,
+                    domain=".youtube.com",
+                    domain_specified=True,
+                    domain_initial_dot=True,
+                    path="/",
+                    path_specified=True,
+                    secure=name.startswith("__Secure-"),
+                    expires=None,
+                    discard=True,
+                    comment=None,
+                    comment_url=None,
+                    rest={"HttpOnly": None},
+                    rfc2109=False,
+                )
+            )
 
     def _minimal_track(self, track_id: str) -> Track:
         """Return a bare-minimum Track so playback can still proceed.

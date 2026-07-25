@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,7 +48,7 @@ class PostgresCacheCatalog:
         return catalog
 
     async def migrate(self) -> None:
-        """Create the additive v1 schema."""
+        """Create the additive cache and account-mirror schemas."""
 
         async with self._pool.acquire() as connection:
             async with connection.transaction():
@@ -116,6 +118,260 @@ class PostgresCacheCatalog:
                     ON CONFLICT (version) DO NOTHING
                     """
                 )
+                await connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ytmusic_account_objects (
+                        provider_instance_id text NOT NULL,
+                        object_type text NOT NULL,
+                        object_id text NOT NULL,
+                        payload jsonb NOT NULL,
+                        first_seen_at timestamptz NOT NULL DEFAULT now(),
+                        last_seen_at timestamptz NOT NULL DEFAULT now(),
+                        PRIMARY KEY (
+                            provider_instance_id, object_type, object_id
+                        )
+                    )
+                    """
+                )
+                await connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ytmusic_account_relations (
+                        provider_instance_id text NOT NULL,
+                        collection text NOT NULL,
+                        owner_id text NOT NULL DEFAULT '',
+                        relation_key text NOT NULL,
+                        object_type text NOT NULL,
+                        object_id text NOT NULL,
+                        position integer,
+                        payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        sync_token uuid NOT NULL,
+                        first_seen_at timestamptz NOT NULL DEFAULT now(),
+                        last_seen_at timestamptz NOT NULL DEFAULT now(),
+                        removed_at timestamptz,
+                        PRIMARY KEY (
+                            provider_instance_id,
+                            collection,
+                            owner_id,
+                            relation_key
+                        )
+                    )
+                    """
+                )
+                await connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS ytmusic_account_relations_read_idx
+                    ON ytmusic_account_relations (
+                        provider_instance_id,
+                        collection,
+                        owner_id,
+                        removed_at,
+                        position
+                    )
+                    """
+                )
+                await connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ytmusic_account_sync_runs (
+                        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                        provider_instance_id text NOT NULL,
+                        collection text NOT NULL,
+                        owner_id text NOT NULL DEFAULT '',
+                        item_count integer NOT NULL,
+                        completed_at timestamptz NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO ytmusic_cache_schema (version)
+                    VALUES (2)
+                    ON CONFLICT (version) DO NOTHING
+                    """
+                )
+                await connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ytmusic_cache_controls (
+                        provider_instance_id text PRIMARY KEY,
+                        cooldown_until timestamptz,
+                        reason text,
+                        updated_at timestamptz NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO ytmusic_cache_schema (version)
+                    VALUES (3)
+                    ON CONFLICT (version) DO NOTHING
+                    """
+                )
+
+    async def replace_account_collection(
+        self,
+        collection: str,
+        owner_id: str,
+        items: list[dict[str, Any]],
+        remove_missing: bool = True,
+    ) -> None:
+        """Upsert one complete relationship snapshot and soft-remove absences."""
+
+        sync_token = str(uuid.uuid4())
+        object_rows = []
+        relation_rows = []
+        for item in items:
+            payload = json.dumps(item["payload"], ensure_ascii=False)
+            object_rows.append(
+                (
+                    self._provider_instance_id,
+                    item["object_type"],
+                    item["object_id"],
+                    payload,
+                )
+            )
+            relation_rows.append(
+                (
+                    self._provider_instance_id,
+                    collection,
+                    owner_id,
+                    item["relation_key"],
+                    item["object_type"],
+                    item["object_id"],
+                    item.get("position"),
+                    payload,
+                    sync_token,
+                )
+            )
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                if object_rows:
+                    await connection.executemany(
+                        """
+                        INSERT INTO ytmusic_account_objects (
+                            provider_instance_id, object_type, object_id, payload
+                        )
+                        VALUES ($1, $2, $3, $4::jsonb)
+                        ON CONFLICT (
+                            provider_instance_id, object_type, object_id
+                        ) DO UPDATE
+                        SET payload = EXCLUDED.payload, last_seen_at = now()
+                        """,
+                        object_rows,
+                    )
+                    await connection.executemany(
+                        """
+                        INSERT INTO ytmusic_account_relations (
+                            provider_instance_id, collection, owner_id,
+                            relation_key, object_type, object_id, position,
+                            payload, sync_token
+                        )
+                        VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::uuid
+                        )
+                        ON CONFLICT (
+                            provider_instance_id, collection, owner_id,
+                            relation_key
+                        ) DO UPDATE
+                        SET object_type = EXCLUDED.object_type,
+                            object_id = EXCLUDED.object_id,
+                            position = EXCLUDED.position,
+                            payload = EXCLUDED.payload,
+                            sync_token = EXCLUDED.sync_token,
+                            last_seen_at = now(),
+                            removed_at = NULL
+                        """,
+                        relation_rows,
+                    )
+                if remove_missing:
+                    await connection.execute(
+                        """
+                        UPDATE ytmusic_account_relations
+                        SET removed_at = now()
+                        WHERE provider_instance_id = $1
+                          AND collection = $2
+                          AND owner_id = $3
+                          AND removed_at IS NULL
+                          AND sync_token <> $4::uuid
+                        """,
+                        self._provider_instance_id,
+                        collection,
+                        owner_id,
+                        sync_token,
+                    )
+                await connection.execute(
+                    """
+                    INSERT INTO ytmusic_account_sync_runs (
+                        provider_instance_id, collection, owner_id, item_count
+                    )
+                    VALUES ($1, $2, $3, $4)
+                    """,
+                    self._provider_instance_id,
+                    collection,
+                    owner_id,
+                    len(items),
+                )
+
+    async def get_account_collection(
+        self,
+        collection: str,
+        owner_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """Return active mirror objects in their source order."""
+
+        rows = await self._pool.fetch(
+            """
+            SELECT object_type, object_id, payload, position,
+                   first_seen_at, last_seen_at
+            FROM ytmusic_account_relations
+            WHERE provider_instance_id = $1
+              AND collection = $2
+              AND owner_id = $3
+              AND removed_at IS NULL
+            ORDER BY
+              CASE WHEN $2 = 'history' THEN last_seen_at END DESC,
+              position NULLS LAST,
+              first_seen_at
+            """,
+            self._provider_instance_id,
+            collection,
+            owner_id,
+        )
+        result = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            result.append(
+                {
+                    "object_type": str(row["object_type"]),
+                    "object_id": str(row["object_id"]),
+                    "payload": payload,
+                    "position": row["position"],
+                }
+            )
+        return result
+
+    async def has_account_collection(
+        self,
+        collection: str,
+        owner_id: str = "",
+    ) -> bool:
+        """Return whether at least one complete snapshot has been recorded."""
+
+        value = await self._pool.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM ytmusic_account_sync_runs
+                WHERE provider_instance_id = $1
+                  AND collection = $2
+                  AND owner_id = $3
+            )
+            """,
+            self._provider_instance_id,
+            collection,
+            owner_id,
+        )
+        return bool(value)
 
     async def enqueue(self, track_ids: list[str], priority: int = 100) -> None:
         """Insert new candidates while preserving existing retry/cache state."""
@@ -174,6 +430,12 @@ class PostgresCacheCatalog:
                 SELECT provider_instance_id, track_id
                 FROM ytmusic_cache_entries
                 WHERE provider_instance_id = $1
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM ytmusic_cache_controls AS control
+                    WHERE control.provider_instance_id = $1
+                      AND control.cooldown_until > now()
+                  )
                   AND (
                     (status IN ('pending', 'retry') AND next_attempt_at <= now())
                     OR (status = 'downloading' AND lease_until < now())
@@ -196,6 +458,25 @@ class PostgresCacheCatalog:
             limit,
         )
         return [CacheJob(str(row["track_id"]), int(row["attempt_count"])) for row in rows]
+
+    async def set_cooldown(self, seconds: int, reason: str) -> None:
+        """Durably stop claims while an upstream-wide challenge is active."""
+
+        await self._pool.execute(
+            """
+            INSERT INTO ytmusic_cache_controls (
+                provider_instance_id, cooldown_until, reason
+            )
+            VALUES ($1, now() + ($2 * interval '1 second'), $3)
+            ON CONFLICT (provider_instance_id) DO UPDATE
+            SET cooldown_until = EXCLUDED.cooldown_until,
+                reason = EXCLUDED.reason,
+                updated_at = now()
+            """,
+            self._provider_instance_id,
+            seconds,
+            reason,
+        )
 
     async def mark_cached(
         self,

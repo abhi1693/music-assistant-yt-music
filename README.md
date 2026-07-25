@@ -14,6 +14,9 @@ YouTube, YouTube Music, or the Music Assistant project.
 - Direct playback without a YouTube Premium subscription
 - Optional saved library, likes, subscriptions, playlists, and recommendations
   through a browser cookie
+- PostgreSQL account mirroring for saved tracks, likes, albums, artists,
+  subscriptions, playlists and membership, history, uploads, podcasts,
+  channels, episodes, and account metadata
 - Multiple Music Assistant provider instances for separate accounts
 - Direct resolution of pasted YouTube and YouTube Music links
 - Optional start/end trimming for individual videos
@@ -27,7 +30,7 @@ Podcast support is not implemented.
 | Component | Responsibility |
 | --- | --- |
 | `ytmusicapi` | Catalogue metadata and authenticated account features |
-| `yt-dlp` | Resolving formats and performing resumable background downloads |
+| `yt-dlp` | Authenticated format resolution and resumable background downloads |
 | Music Assistant | Library management, queueing, decoding, normalization, and players |
 | Persistent cache | Serving atomically published background downloads locally |
 
@@ -36,6 +39,14 @@ native background task uses yt-dlp to download into persistent local staging,
 where interrupted transfers can resume. A complete stage is copied, flushed,
 and atomically promoted on the cache filesystem. Interrupted transfers and
 publication copies are never accepted as cache hits.
+
+Each background claim performs one authenticated extraction and passes that
+already-resolved format directly to yt-dlp. The provider loads its configured
+browser session into yt-dlp's in-memory cookie jar and reuses the Google account
+selector for extraction and media requests; no plaintext cookie file is
+created, and the downloader does not repeat an anonymous watch-page extraction.
+Requests are paced, and a YouTube bot-verification response creates a durable
+PostgreSQL cooldown before further queue claims.
 
 Before any custom stream begins, the provider checks the cache again. This
 matters because Music Assistant may preload stream details while the background
@@ -51,9 +62,9 @@ reads it locally instead of opening another YouTube stream.
 - The highest-quality option means the best format yt-dlp can access for that
   request. Anonymous playback commonly resolves to Opus around 128–160 kbps; it
   does not imply lossless audio.
-- The current playback extractor does not use the account cookie supplied for
-  library synchronization, so YouTube Music Premium's 256 kbps tier is not
-  guaranteed.
+- The authenticated extractor can only select formats YouTube exposes to the
+  configured browser session. A Premium cookie may expose a higher tier, but
+  this integration does not guarantee a particular bitrate.
 - YouTube Music does not provide a lossless source through this integration.
   Use a dedicated library manager and a lawful lossless source if archival
   quality is required.
@@ -203,12 +214,15 @@ name without changing its internal `ytmusic_free` domain.
 | Cache directory | `/data/ytmusic-cache` | Writable persistent cache location |
 | Cache staging directory | `/data/ytmusic-cache-staging` | Persistent local workspace for resumable yt-dlp downloads |
 | PostgreSQL cache catalog DSN | Empty | Enables durable queue, leases, retries, and cache metadata |
+| Mirror complete account | Enabled | Persists supported account collections and ordered relationships in PostgreSQL |
+| Account mirror interval | 6 hours | Refresh cadence for the account snapshot |
 | Prefetch library to cache | Disabled | Registers an app-native scheduled cache task |
 | Include playlists in prefetch | Disabled | Adds authenticated library playlists to the prefetch scope |
 | Prefetch interval | 6 hours | Recurring Music Assistant task schedule |
 | Maximum tracks per run | 100 | Bounds work performed by one task run |
 | Maximum cache size | 50 GB | Stops prefetch without evicting completed files; `0` disables the limit |
 | Pause prefetch while players are active | Disabled | Optional bandwidth protection; downloads continue during playback by default |
+| Delay between prefetch requests | 15 seconds | Protects the authenticated session from bulk-request bot challenges |
 
 ## Optional account authentication
 

@@ -30,6 +30,31 @@ class FakePool:
         self.closed = True
 
 
+class _AsyncContext:
+    def __init__(self, value):
+        self.value = value
+
+    async def __aenter__(self):
+        return self.value
+
+    async def __aexit__(self, *_args):
+        return None
+
+
+class TransactionalFakePool(FakePool):
+    """Support the transaction surface used by account snapshots."""
+
+    def acquire(self):
+        return _AsyncContext(self)
+
+    def transaction(self):
+        return _AsyncContext(self)
+
+    async def fetchval(self, query, *args):
+        self.calls.append((query, args))
+        return True
+
+
 def test_enqueue_is_instance_scoped_and_idempotent():
     pool = FakePool()
     catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
@@ -99,3 +124,47 @@ def test_close_closes_pool():
     asyncio.run(catalog.close())
 
     assert pool.closed is True
+
+
+def test_account_snapshot_is_instance_scoped_and_soft_removes_absences():
+    pool = TransactionalFakePool()
+    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+
+    asyncio.run(
+        catalog.replace_account_collection(
+            "liked_tracks",
+            "",
+            [
+                {
+                    "object_type": "track",
+                    "object_id": "video-id",
+                    "relation_key": "video-id",
+                    "position": 0,
+                    "payload": {"videoId": "video-id", "title": "Song"},
+                }
+            ],
+        )
+    )
+
+    statements = "\n".join(query for query, _args in pool.calls)
+    assert "ytmusic_account_objects" in statements
+    assert "ytmusic_account_relations" in statements
+    assert "removed_at = now()" in statements
+    assert "ytmusic_account_sync_runs" in statements
+    assert "ytmusic_free--home" in repr(pool.calls)
+
+
+def test_prefetch_cooldown_is_durable_and_scoped_to_provider():
+    pool = FakePool()
+    catalog = PostgresCacheCatalog(pool, "ytmusic_free--home", logging.getLogger())
+
+    asyncio.run(catalog.set_cooldown(21600, "YouTube bot challenge"))
+
+    query, args = pool.calls[0]
+    assert "ytmusic_cache_controls" in query
+    assert "ON CONFLICT" in query
+    assert args == (
+        "ytmusic_free--home",
+        21600,
+        "YouTube bot challenge",
+    )

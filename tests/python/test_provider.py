@@ -948,12 +948,15 @@ def test_get_config_entries_returns_expected_keys():
         ytm.CONF_CACHE_DIRECTORY,
         ytm.CONF_CACHE_STAGING_DIRECTORY,
         ytm.CONF_CACHE_CATALOG_DSN,
+        ytm.CONF_ACCOUNT_SYNC_ENABLED,
+        ytm.CONF_ACCOUNT_SYNC_INTERVAL,
         ytm.CONF_PREFETCH_ENABLED,
         ytm.CONF_PREFETCH_PLAYLISTS,
         ytm.CONF_PREFETCH_INTERVAL,
         ytm.CONF_PREFETCH_MAX_TRACKS,
         ytm.CONF_PREFETCH_MAX_CACHE_GB,
         ytm.CONF_PREFETCH_PAUSE_PLAYBACK,
+        ytm.CONF_PREFETCH_REQUEST_DELAY,
     ]
     cookie_entry = next(e for e in entries if e.key == ytm.CONF_COOKIE)
     assert cookie_entry.depends_on == ytm.CONF_AUTH_TYPE
@@ -1158,6 +1161,7 @@ def test_catalog_prefetch_claims_only_one_job_at_a_time(provider, tmp_path):
         ytm.CONF_PREFETCH_MAX_TRACKS: 100,
         ytm.CONF_PREFETCH_MAX_CACHE_GB: 50,
         ytm.CONF_PREFETCH_PAUSE_PLAYBACK: False,
+        ytm.CONF_PREFETCH_REQUEST_DELAY: 0,
     }
     provider.config = SimpleNamespace(get_value=values.get)
     provider.mass = SimpleNamespace(
@@ -1175,6 +1179,61 @@ def test_catalog_prefetch_claims_only_one_job_at_a_time(provider, tmp_path):
 
     assert downloaded == ["first-video", "second-video"]
     assert provider._cache_catalog.claims == [1, 1, 1]
+
+
+def test_catalog_prefetch_progress_never_exceeds_one_hundred(provider, tmp_path):
+    """Older durable claims must not overflow progress for a short fresh list."""
+
+    from ytmusic_free.catalog import CacheJob
+
+    class Catalog:
+        jobs = [
+            CacheJob("first-video", 1),
+            CacheJob("second-video", 1),
+            CacheJob("third-video", 1),
+        ]
+
+        async def claim(self, _limit):
+            return [self.jobs.pop(0)] if self.jobs else []
+
+        async def mark_cached(self, *_args):
+            return None
+
+    progress_values = []
+    values = {
+        ytm.CONF_PREFETCH_MAX_TRACKS: 3,
+        ytm.CONF_PREFETCH_MAX_CACHE_GB: 50,
+        ytm.CONF_PREFETCH_PAUSE_PLAYBACK: False,
+        ytm.CONF_PREFETCH_REQUEST_DELAY: 0,
+    }
+    provider.config = SimpleNamespace(get_value=values.get)
+    provider.mass = SimpleNamespace(
+        players=[],
+        tasks=SimpleNamespace(
+            update_current_task_progress=lambda value, *_args: progress_values.append(
+                value
+            )
+        ),
+    )
+    provider._authenticated = True
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+    provider._cache_catalog = Catalog()
+    provider._prefetch_candidates = lambda _limit: asyncio.sleep(
+        0, result=["fresh-only"]
+    )
+
+    async def prefetch_track(video_id, *_args):
+        cache_file = tmp_path / f"{hashlib.sha256(video_id.encode()).hexdigest()}.webm"
+        cache_file.write_bytes(b"audio")
+        return ("downloaded", 5)
+
+    provider._prefetch_track = prefetch_track
+
+    asyncio.run(provider._run_cache_prefetch())
+
+    assert progress_values[-1] == 100
+    assert all(0 <= value <= 100 for value in progress_values)
 
 
 def test_prefetch_pauses_without_downloading_during_playback(provider, tmp_path):
@@ -1239,11 +1298,13 @@ def test_prefetch_track_atomically_publishes_completed_audio(provider, tmp_path)
         def __exit__(self, *_args):
             return None
 
-        def download(self, _urls):
+        def process_ie_result(self, info, download):
+            assert download is True
+            assert info["url"] == "https://stream.example/audio"
             output = Path(observed_options["outtmpl"])
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(payload)
-            return 0
+            return info
 
     async def stream_format(_video_id):
         return {
@@ -1280,7 +1341,96 @@ def test_prefetch_track_atomically_publishes_completed_audio(provider, tmp_path)
     assert not list(staging_dir.iterdir())
     assert observed_options["continuedl"] is True
     assert observed_options["http_chunk_size"] == 10 * 1024 * 1024
-    assert observed_options["format"] == "251"
+    assert "format" not in observed_options
+
+
+def test_prefetch_uses_authenticated_headers_and_resolved_format(provider, tmp_path):
+    """The downloader must reuse the provider cookie without re-extracting."""
+
+    observed = {}
+
+    class CookieJar:
+        def set_cookie(self, cookie):
+            observed.setdefault("cookies", []).append(cookie)
+
+    class YoutubeDL:
+        def __init__(self, options):
+            observed["options"] = options
+            self.cookiejar = CookieJar()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def process_ie_result(self, info, download):
+            observed["info"] = info
+            Path(observed["options"]["outtmpl"]).write_bytes(b"audio")
+            return info
+
+    provider.mass = SimpleNamespace(players=[])
+    provider._auth_headers = {
+        "cookie": "__Secure-3PAPISID=secret; SAPISID=secret",
+        "x-goog-authuser": "2",
+        "origin": ytm.YTM_DOMAIN,
+        "authorization": "SAPISIDHASH value",
+        "content-type": "application/json",
+    }
+    provider._cache_staging_directory = str(tmp_path)
+    provider._yt_dlp_module = SimpleNamespace(YoutubeDL=YoutubeDL)
+    stream_format = {
+        "url": "https://stream.example/audio",
+        "format_id": "251",
+        "http_headers": {"Referer": ytm.YTM_DOMAIN},
+    }
+
+    provider._download_to_staging(
+        "video-id",
+        stream_format,
+        str(tmp_path / "audio.webm"),
+        False,
+    )
+
+    assert "Cookie" not in observed["options"]["http_headers"]
+    assert observed["options"]["http_headers"]["X-Goog-Authuser"] == "2"
+    assert {cookie.name for cookie in observed["cookies"]} == {
+        "__Secure-3PAPISID",
+        "SAPISID",
+    }
+    assert all(cookie.domain == ".youtube.com" for cookie in observed["cookies"])
+    assert observed["info"]["url"] == "https://stream.example/audio"
+    assert observed["info"]["format_id"] == "251"
+    assert observed["info"]["http_headers"]["Referer"] == ytm.YTM_DOMAIN
+
+
+def test_library_tracks_use_deduplicated_saved_liked_and_history_mirror(provider):
+    """Completed PostgreSQL snapshots are the durable MA library source."""
+
+    snapshots = {
+        "saved_tracks": [
+            {"videoId": "saved", "title": "Saved"},
+            {"videoId": "duplicate", "title": "Duplicate"},
+        ],
+        "liked_tracks": [
+            {"videoId": "liked", "title": "Liked"},
+            {"videoId": "duplicate", "title": "Duplicate"},
+        ],
+        "history": [{"videoId": "history", "title": "History"}],
+    }
+
+    async def mirrored(collection, _owner_id=""):
+        return snapshots.get(collection)
+
+    provider._authenticated = True
+    provider._mirrored_payloads = mirrored
+    provider._parse_track = lambda item: SimpleNamespace(item_id=item["videoId"])
+    provider._guard_partial_auth_empty = lambda *_args: asyncio.sleep(0)
+
+    async def collect():
+        return [track.item_id async for track in provider.get_library_tracks()]
+
+    assert asyncio.run(collect()) == ["saved", "duplicate", "liked", "history"]
 
 
 def test_prefetch_resumes_existing_ytdlp_partial(provider, tmp_path):
@@ -1301,13 +1451,15 @@ def test_prefetch_resumes_existing_ytdlp_partial(provider, tmp_path):
         def __exit__(self, *_args):
             return None
 
-        def download(self, _urls):
+        def process_ie_result(self, info, download):
+            assert download is True
+            assert info["url"] == "https://stream.example/audio"
             output = Path(observed["outtmpl"])
             partial = Path(f"{output}.part")
             assert partial.read_bytes() == b"first half"
             output.write_bytes(partial.read_bytes() + b" second half")
             partial.unlink()
-            return 0
+            return info
 
     async def stream_format(_video_id):
         return {
