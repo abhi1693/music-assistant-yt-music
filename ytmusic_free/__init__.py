@@ -114,7 +114,6 @@ CONF_AUTH_USER = "auth_user"
 CONF_PREFER_AUDIO_QUALITY = "prefer_audio_quality"
 CONF_CACHE_ENABLED = "cache_enabled"
 CONF_CACHE_DIRECTORY = "cache_directory"
-CONF_CACHE_DURING_PLAYBACK = "cache_during_playback"
 CONF_PREFETCH_ENABLED = "prefetch_enabled"
 CONF_PREFETCH_PLAYLISTS = "prefetch_playlists"
 CONF_PREFETCH_INTERVAL = "prefetch_interval_hours"
@@ -361,18 +360,6 @@ async def get_config_entries(
             "on storage that survives Music Assistant restarts.",
         ),
         ConfigEntry(
-            key=CONF_CACHE_DURING_PLAYBACK,
-            type=ConfigEntryType.BOOLEAN,
-            label="Cache during playback (unsafe compatibility mode)",
-            default_value=False,
-            required=False,
-            depends_on=CONF_CACHE_ENABLED,
-            depends_on_value=[True],
-            description="Legacy mode that tees foreground playback into the cache. Keep "
-            "disabled: Music Assistant may reopen preloaded streams while a file is "
-            "published, which can interrupt playback. Use background prefetch instead.",
-        ),
-        ConfigEntry(
             key=CONF_PREFETCH_ENABLED,
             type=ConfigEntryType.BOOLEAN,
             label="Prefetch library to cache",
@@ -446,7 +433,6 @@ class YoutubeMusicFreeProvider(MusicProvider):
     _authenticated: bool = False
     _auth_lapse_warned: bool = False
     _cache_enabled: bool = True
-    _cache_during_playback: bool = False
     _cache_directory: str = DEFAULT_CACHE_DIRECTORY
     _cache_writers: set[str]
     _prefetch_task_id: str
@@ -471,9 +457,6 @@ class YoutubeMusicFreeProvider(MusicProvider):
         self._prefer_quality = True if prefer_quality is None else bool(prefer_quality)
         cache_enabled = self.config.get_value(CONF_CACHE_ENABLED)
         self._cache_enabled = True if cache_enabled is None else bool(cache_enabled)
-        self._cache_during_playback = bool(
-            self.config.get_value(CONF_CACHE_DURING_PLAYBACK)
-        )
         configured_cache_directory = str(
             self.config.get_value(CONF_CACHE_DIRECTORY) or DEFAULT_CACHE_DIRECTORY
         )
@@ -1389,31 +1372,12 @@ class YoutubeMusicFreeProvider(MusicProvider):
             audio_format=AudioFormat(
                 content_type=content_type,
             ),
-            stream_type=(
-                StreamType.CUSTOM
-                if (
-                    self._cache_enabled
-                    and self._cache_during_playback
-                    and start is None
-                    and end is None
-                )
-                else StreamType.HTTP
-            ),
+            stream_type=StreamType.HTTP,
             path=url,
             # A first-play cache is a single forward-only transfer. Once complete,
             # the LOCAL_FILE path above restores accurate seeking.
-            can_seek=(
-                not self._cache_enabled
-                or not self._cache_during_playback
-                or start is not None
-                or end is not None
-            ),
-            allow_seek=(
-                not self._cache_enabled
-                or not self._cache_during_playback
-                or start is not None
-                or end is not None
-            ),
+            can_seek=True,
+            allow_seek=True,
             expiration=expiration,
             data={
                 "http_headers": stream_format.get("http_headers") or {},
@@ -1458,129 +1422,6 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 if end is not None:
                     stream_details.duration = end - (start or 0)
         return stream_details
-
-    async def get_audio_stream(
-        self, streamdetails: StreamDetails, seek_position: int = 0
-    ) -> AsyncGenerator[bytes]:
-        """Tee one complete upstream transfer to Music Assistant and the cache."""
-
-        data = streamdetails.data if isinstance(streamdetails.data, dict) else {}
-        cache_path = str(
-            data.get("cache_path") or self._cache_path(streamdetails.item_id, "audio")
-        )
-        # Never replace an already-resolved foreground stream with a cache file
-        # that appeared after resolution. Music Assistant may hold and reopen
-        # preloaded StreamDetails; changing their source can replace the active
-        # audio buffer mid-play. Cache hits are selected only by a fresh
-        # get_stream_details call above.
-        cache_target_already_exists = os.path.isfile(cache_path)
-        headers = {
-            str(key): str(value)
-            for key, value in (data.get("http_headers") or {}).items()
-        }
-        if seek_position:
-            raise UnplayableMediaError("Seeking is available after the first play is cached")
-        if cache_path in self._cache_writers:
-            # Do not let a second listener corrupt the in-progress file. It still
-            # receives a normal stream, but only the first listener owns the cache.
-            async with self.mass.http_session.get(
-                str(streamdetails.path), headers=headers
-            ) as response:
-                response.raise_for_status()
-                async for chunk in response.content.iter_chunked(64 * 1024):
-                    yield chunk
-            return
-
-        partial_path = f"{cache_path}.part"
-        completed = False
-        cache_file = None
-        bytes_written = 0
-        expected_size = data.get("expected_size")
-        try:
-            expected_size = int(expected_size) if expected_size is not None else None
-        except (TypeError, ValueError):
-            expected_size = None
-        self._cache_writers.add(cache_path)
-        try:
-            try:
-                await asyncio.to_thread(
-                    os.makedirs,
-                    self._cache_directory,
-                    mode=0o775,
-                    exist_ok=True,
-                )
-            except OSError as err:
-                self.logger.warning(
-                    "Cache directory %s is unavailable; continuing playback without "
-                    "caching: %s",
-                    self._cache_directory,
-                    err,
-                )
-            else:
-                if cache_target_already_exists:
-                    cache_file = None
-                else:
-                    try:
-                        cache_file = open(partial_path, "wb")
-                    except OSError as err:
-                        self.logger.warning(
-                            "Unable to open cache file %s; continuing playback without "
-                            "caching: %s",
-                            partial_path,
-                            err,
-                        )
-
-            async with self.mass.http_session.get(
-                str(streamdetails.path), headers=headers
-            ) as response:
-                response.raise_for_status()
-                if response.content_length is not None:
-                    expected_size = response.content_length
-                async for chunk in response.content.iter_chunked(64 * 1024):
-                    if cache_file is not None:
-                        cache_file.write(chunk)
-                        bytes_written += len(chunk)
-                    yield chunk
-                if cache_file is not None:
-                    cache_file.flush()
-                    os.fsync(cache_file.fileno())
-                    cache_file.close()
-                    cache_file = None
-                    await asyncio.to_thread(os.replace, partial_path, cache_path)
-                    completed = True
-                    self.logger.info(
-                        "Cached YouTube Music track %s at %s",
-                        streamdetails.item_id,
-                        cache_path,
-                    )
-        finally:
-            if cache_file is not None:
-                cache_file.flush()
-                os.fsync(cache_file.fileno())
-                cache_file.close()
-                cache_file = None
-                # Music Assistant may close the async generator immediately after
-                # consuming its final yielded chunk. In that lifecycle the loop
-                # body has received the complete response, but control never
-                # reaches the normal EOF publication block above. Promote only
-                # when the exact upstream byte count proves the file is complete.
-                if (
-                    not completed
-                    and expected_size is not None
-                    and bytes_written == expected_size
-                    and bytes_written > 0
-                ):
-                    await asyncio.to_thread(os.replace, partial_path, cache_path)
-                    completed = True
-                    self.logger.info(
-                        "Cached YouTube Music track %s at %s",
-                        streamdetails.item_id,
-                        cache_path,
-                    )
-            self._cache_writers.discard(cache_path)
-            if not completed:
-                with suppress(OSError):
-                    await asyncio.to_thread(os.remove, partial_path)
 
     def _foreground_playback_active(self) -> bool:
         """Return whether any Music Assistant player is currently playing."""

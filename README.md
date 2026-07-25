@@ -200,7 +200,6 @@ name without changing its internal `ytmusic_free` domain.
 | Account index | `0` | Selects an account from a multi-account Google session |
 | Prefer highest audio quality | Enabled | Selects yt-dlp's highest-ranked accessible audio format |
 | Cache streamed tracks | Enabled | Reuses completed local files and enables background prefetch |
-| Cache during playback | Disabled | Unsafe compatibility mode; background prefetch is the safe writer |
 | Cache directory | `/data/ytmusic-cache` | Writable persistent cache location |
 | Prefetch library to cache | Disabled | Registers an app-native scheduled cache task |
 | Include playlists in prefetch | Disabled | Adds authenticated library playlists to the prefetch scope |
