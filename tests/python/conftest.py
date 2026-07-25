@@ -35,6 +35,18 @@ def _new_module(name: str) -> types.ModuleType:
 def _install_music_assistant_models() -> None:
     pkg = _new_module("music_assistant_models")
 
+    background_task = _new_module("music_assistant_models.background_task")
+
+    @dataclass
+    class _TaskSchedule:
+        every: int
+
+        @classmethod
+        def hourly(cls, *, every: int = 1):
+            return cls(every=every)
+
+    background_task.TaskSchedule = _TaskSchedule
+
     config_entries = _new_module("music_assistant_models.config_entries")
 
     class _ConfigEntryType(str, Enum):
@@ -324,6 +336,7 @@ def _install_music_assistant_models() -> None:
     provider_mod.ProviderManifest = object
 
     pkg.config_entries = config_entries
+    pkg.background_task = background_task
     pkg.enums = enums
     pkg.errors = errors
     pkg.media_items = media_items
@@ -378,6 +391,12 @@ def _install_music_assistant() -> None:
             self.config = config
             self.supported_features = supported_features or set()
             self.logger = logging.getLogger("ytmusic_free_test")
+
+        async def loaded_in_mass(self):
+            return None
+
+        async def unload(self, is_removed=False):
+            return None
 
     music_provider_mod.MusicProvider = _MusicProvider
     models.music_provider = music_provider_mod

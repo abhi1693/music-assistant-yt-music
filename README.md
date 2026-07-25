@@ -201,6 +201,12 @@ name without changing its internal `ytmusic_free` domain.
 | Prefer highest audio quality | Enabled | Selects yt-dlp's highest-ranked accessible audio format |
 | Cache streamed tracks | Enabled | Saves complete, untrimmed first plays |
 | Cache directory | `/data/ytmusic-cache` | Writable persistent cache location |
+| Prefetch library to cache | Disabled | Registers an app-native scheduled cache task |
+| Include playlists in prefetch | Disabled | Adds authenticated library playlists to the prefetch scope |
+| Prefetch interval | 6 hours | Recurring Music Assistant task schedule |
+| Maximum tracks per run | 100 | Bounds work performed by one task run |
+| Maximum cache size | 50 GB | Stops prefetch without evicting completed files; `0` disables the limit |
+| Pause prefetch while players are active | Enabled | Preserves foreground playback bandwidth |
 
 ## Optional account authentication
 
@@ -330,6 +336,36 @@ services:
 
 For NFS, ensure the Music Assistant container's UID/GID can create, flush,
 rename, and read files in the target directory.
+
+## Native background prefetch
+
+Authenticated installations can download uncached library tracks before they
+are played. Enable **Prefetch library to cache** in the provider settings.
+
+The provider registers a recurring task through Music Assistant's native
+Background Tasks controller. It does not require a sidecar, Kubernetes job,
+cron process, or separate queue service. The task appears in Music Assistant
+with its schedule, progress, retained logs, manual **Run now**, cancellation,
+and retry controls.
+
+Each run:
+
+1. Enumerates authenticated library tracks.
+2. Optionally enumerates tracks from library playlists.
+3. Skips completed cache entries.
+4. Downloads at most the configured number of new tracks, sequentially.
+5. Uses the same audio-quality selector and atomic cache publication as
+   foreground playback.
+6. Stops at the configured cache-size ceiling without deleting existing files.
+7. Pauses when foreground playback is active when that protection is enabled.
+
+Completed cache files are the durable task state. After a restart or cancelled
+run, the next execution rescans the library and continues with missing tracks;
+there is no second queue database to repair.
+
+Prefetch requires a Music Assistant release that exposes the native Background
+Tasks controller. Older releases continue to support normal playback and
+read-through caching, but log a warning and do not register the scheduled task.
 
 ## Supported features
 

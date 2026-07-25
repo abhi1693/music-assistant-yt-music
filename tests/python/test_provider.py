@@ -944,6 +944,12 @@ def test_get_config_entries_returns_expected_keys():
         ytm.CONF_PREFER_AUDIO_QUALITY,
         ytm.CONF_CACHE_ENABLED,
         ytm.CONF_CACHE_DIRECTORY,
+        ytm.CONF_PREFETCH_ENABLED,
+        ytm.CONF_PREFETCH_PLAYLISTS,
+        ytm.CONF_PREFETCH_INTERVAL,
+        ytm.CONF_PREFETCH_MAX_TRACKS,
+        ytm.CONF_PREFETCH_MAX_CACHE_GB,
+        ytm.CONF_PREFETCH_PAUSE_PLAYBACK,
     ]
     cookie_entry = next(e for e in entries if e.key == ytm.CONF_COOKIE)
     assert cookie_entry.depends_on == ytm.CONF_AUTH_TYPE
@@ -1042,6 +1048,169 @@ def test_preloaded_stream_details_recheck_completed_cache(provider, tmp_path):
 
     assert asyncio.run(consume()) == b"already cached"
     assert not (tmp_path / "track.webm.part").exists()
+
+
+def test_loaded_provider_registers_native_prefetch_task(provider, tmp_path):
+    """Authenticated prefetch uses Music Assistant's scheduled-task controller."""
+
+    values = {
+        ytm.CONF_PREFETCH_ENABLED: True,
+        ytm.CONF_PREFETCH_INTERVAL: 6,
+    }
+
+    class Tasks:
+        registered = None
+
+        def register_scheduled_task(self, **kwargs):
+            self.registered = kwargs
+
+    tasks = Tasks()
+    provider.mass = SimpleNamespace(tasks=tasks)
+    provider.config = SimpleNamespace(get_value=lambda key: values.get(key))
+    provider._authenticated = True
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+    provider._prefetch_task_id = f"{provider.instance_id}_prefetch"
+
+    asyncio.run(provider.loaded_in_mass())
+
+    assert tasks.registered["task_id"] == f"{provider.instance_id}_prefetch"
+    assert tasks.registered["schedule"].every == 6
+    assert tasks.registered["handler"] == provider._run_cache_prefetch
+    assert tasks.registered["allow_cancel"] is True
+    assert tasks.registered["allow_retry"] is True
+
+
+def test_prefetch_downloads_library_tracks_with_native_progress(provider, tmp_path):
+    """The scheduled handler bounds work and reports progress through MA."""
+
+    values = {
+        ytm.CONF_PREFETCH_PLAYLISTS: False,
+        ytm.CONF_PREFETCH_MAX_TRACKS: 100,
+        ytm.CONF_PREFETCH_MAX_CACHE_GB: 50,
+        ytm.CONF_PREFETCH_PAUSE_PLAYBACK: True,
+    }
+
+    class Tasks:
+        progress = []
+
+        def update_current_task_progress(self, value, text=None):
+            self.progress.append((value, text))
+
+    async def library_tracks():
+        yield ytm.Track(
+            item_id="first-video",
+            provider=provider.instance_id,
+            name="First",
+        )
+        yield ytm.Track(
+            item_id="second-video",
+            provider=provider.instance_id,
+            name="Second",
+        )
+
+    downloaded = []
+
+    async def prefetch_track(video_id, cache_size, cache_limit, pause):
+        downloaded.append((video_id, cache_size, cache_limit, pause))
+        return ("downloaded", 1024)
+
+    provider.mass = SimpleNamespace(tasks=Tasks(), players=[])
+    provider.config = SimpleNamespace(get_value=lambda key: values.get(key))
+    provider._authenticated = True
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+    provider.get_library_tracks = library_tracks
+    provider._prefetch_track = prefetch_track
+
+    asyncio.run(provider._run_cache_prefetch())
+
+    assert [item[0] for item in downloaded] == ["first-video", "second-video"]
+    assert downloaded[1][1] == 1024
+    assert downloaded[0][2] == 50 * 1024 * 1024 * 1024
+    assert downloaded[0][3] is True
+    assert provider.mass.tasks.progress[-1] == (
+        100,
+        "Downloaded 2, skipped 0, failed 0",
+    )
+
+
+def test_prefetch_pauses_without_downloading_during_playback(provider, tmp_path):
+    """Foreground players prevent a scheduled prefetch run from using bandwidth."""
+
+    values = {
+        ytm.CONF_PREFETCH_PAUSE_PLAYBACK: True,
+    }
+    player = SimpleNamespace(playback_state=SimpleNamespace(value="playing"))
+    tasks = SimpleNamespace(update_current_task_progress=lambda *_args: None)
+    provider.mass = SimpleNamespace(tasks=tasks, players=[player])
+    provider.config = SimpleNamespace(get_value=lambda key: values.get(key))
+    provider._authenticated = True
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+
+    async def should_not_enumerate(_limit):
+        raise AssertionError("active playback must stop before library enumeration")
+
+    provider._prefetch_candidates = should_not_enumerate
+    asyncio.run(provider._run_cache_prefetch())
+
+
+def test_prefetch_track_atomically_publishes_completed_audio(provider, tmp_path):
+    """Background downloads use the same durable final-file contract."""
+
+    payload = b"prefetched audio"
+
+    class Content:
+        async def iter_chunked(self, _size):
+            yield payload
+
+    class Response:
+        content = Content()
+        content_length = len(payload)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+    class Session:
+        def get(self, _url, headers=None):
+            return Response()
+
+    async def stream_format(_video_id):
+        return {
+            "url": "https://stream.example/audio",
+            "audio_ext": "webm",
+            "http_headers": {},
+        }
+
+    provider.mass = SimpleNamespace(http_session=Session(), players=[])
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+    provider._cache_writers = set()
+    provider._get_stream_format = stream_format
+
+    result, added_bytes = asyncio.run(
+        provider._prefetch_track(
+            "prefetch-video",
+            cache_size=0,
+            cache_limit=1024 * 1024,
+            pause_during_playback=True,
+        )
+    )
+
+    assert result == "downloaded"
+    assert added_bytes == len(payload)
+    files = list(tmp_path.iterdir())
+    assert len(files) == 1
+    assert files[0].suffix == ".webm"
+    assert files[0].read_bytes() == payload
+    assert not list(tmp_path.glob("*.part"))
 
 
 def test_interrupted_stream_does_not_publish_partial_cache(provider, tmp_path):

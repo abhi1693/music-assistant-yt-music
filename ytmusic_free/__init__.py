@@ -60,6 +60,11 @@ from music_assistant_models.streamdetails import StreamDetails
 from music_assistant.helpers.util import infer_album_type, install_package, parse_title_and_version
 from music_assistant.models.music_provider import MusicProvider
 
+try:
+    from music_assistant_models.background_task import TaskSchedule
+except ImportError:  # Music Assistant releases before the native task controller
+    TaskSchedule = None  # type: ignore[assignment,misc]
+
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.provider import ProviderManifest
@@ -109,6 +114,12 @@ CONF_AUTH_USER = "auth_user"
 CONF_PREFER_AUDIO_QUALITY = "prefer_audio_quality"
 CONF_CACHE_ENABLED = "cache_enabled"
 CONF_CACHE_DIRECTORY = "cache_directory"
+CONF_PREFETCH_ENABLED = "prefetch_enabled"
+CONF_PREFETCH_PLAYLISTS = "prefetch_playlists"
+CONF_PREFETCH_INTERVAL = "prefetch_interval_hours"
+CONF_PREFETCH_MAX_TRACKS = "prefetch_max_tracks"
+CONF_PREFETCH_MAX_CACHE_GB = "prefetch_max_cache_gb"
+CONF_PREFETCH_PAUSE_PLAYBACK = "prefetch_pause_playback"
 AUTH_TYPE_NONE = "none"
 AUTH_TYPE_COOKIE = "cookie"
 DEFAULT_CACHE_DIRECTORY = "/data/ytmusic-cache"
@@ -348,6 +359,68 @@ async def get_config_entries(
             description="Writable persistent path for provider-owned audio files. Use a path "
             "on storage that survives Music Assistant restarts.",
         ),
+        ConfigEntry(
+            key=CONF_PREFETCH_ENABLED,
+            type=ConfigEntryType.BOOLEAN,
+            label="Prefetch library to cache",
+            default_value=False,
+            required=False,
+            depends_on=CONF_CACHE_ENABLED,
+            depends_on_value=[True],
+            description="Register a native Music Assistant background task that downloads "
+            "uncached library tracks ahead of playback. Requires browser-cookie authentication.",
+        ),
+        ConfigEntry(
+            key=CONF_PREFETCH_PLAYLISTS,
+            type=ConfigEntryType.BOOLEAN,
+            label="Include playlists in prefetch",
+            default_value=False,
+            required=False,
+            depends_on=CONF_PREFETCH_ENABLED,
+            depends_on_value=[True],
+            description="Also cache tracks from authenticated library playlists.",
+        ),
+        ConfigEntry(
+            key=CONF_PREFETCH_INTERVAL,
+            type=ConfigEntryType.INTEGER,
+            label="Prefetch interval (hours)",
+            default_value=6,
+            required=False,
+            depends_on=CONF_PREFETCH_ENABLED,
+            depends_on_value=[True],
+            description="How often Music Assistant schedules the prefetch task.",
+        ),
+        ConfigEntry(
+            key=CONF_PREFETCH_MAX_TRACKS,
+            type=ConfigEntryType.INTEGER,
+            label="Maximum tracks per prefetch run",
+            default_value=100,
+            required=False,
+            depends_on=CONF_PREFETCH_ENABLED,
+            depends_on_value=[True],
+            description="Maximum number of new tracks downloaded by one scheduled run.",
+        ),
+        ConfigEntry(
+            key=CONF_PREFETCH_MAX_CACHE_GB,
+            type=ConfigEntryType.INTEGER,
+            label="Maximum cache size (GB)",
+            default_value=50,
+            required=False,
+            depends_on=CONF_PREFETCH_ENABLED,
+            depends_on_value=[True],
+            description="Stop prefetching after completed cache files reach this size. "
+            "Existing files are never evicted. Set to 0 for no size limit.",
+        ),
+        ConfigEntry(
+            key=CONF_PREFETCH_PAUSE_PLAYBACK,
+            type=ConfigEntryType.BOOLEAN,
+            label="Pause prefetch while players are active",
+            default_value=True,
+            required=False,
+            depends_on=CONF_PREFETCH_ENABLED,
+            depends_on_value=[True],
+            description="Keep foreground playback ahead of background downloads.",
+        ),
     )
 
 
@@ -362,6 +435,8 @@ class YoutubeMusicFreeProvider(MusicProvider):
     _cache_enabled: bool = True
     _cache_directory: str = DEFAULT_CACHE_DIRECTORY
     _cache_writers: set[str]
+    _prefetch_task_id: str
+    _prefetch_task_registered: bool
     # Per-category flag: True once we've seen a non-empty sync. Used to tell a
     # genuinely empty library apart from a partial-auth HTTP 200 response that
     # ytmusicapi unwraps to []. See issue #10.
@@ -387,6 +462,8 @@ class YoutubeMusicFreeProvider(MusicProvider):
         )
         self._cache_directory = os.path.abspath(configured_cache_directory)
         self._cache_writers = set()
+        self._prefetch_task_id = f"{self.instance_id}_prefetch"
+        self._prefetch_task_registered = False
 
         auth_type = self.config.get_value(CONF_AUTH_TYPE) or AUTH_TYPE_NONE
         if auth_type == AUTH_TYPE_COOKIE:
@@ -423,6 +500,58 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
         if not self._authenticated:
             self.logger.info("YouTube Music (Free) initialized — anonymous mode")
+
+    async def loaded_in_mass(self) -> None:
+        """Register the native Music Assistant prefetch task after provider load."""
+
+        await super().loaded_in_mass()
+        if not (
+            self._authenticated
+            and self._cache_enabled
+            and self.config.get_value(CONF_PREFETCH_ENABLED)
+        ):
+            return
+        if TaskSchedule is None or not hasattr(self.mass, "tasks"):
+            self.logger.warning(
+                "YouTube Music prefetch requires a Music Assistant release with "
+                "native background tasks"
+            )
+            return
+        interval = self._config_positive_int(CONF_PREFETCH_INTERVAL, 6)
+        self.mass.tasks.register_scheduled_task(
+            task_id=self._prefetch_task_id,
+            name=f"{self.name} library prefetch",
+            handler=self._run_cache_prefetch,
+            schedule=TaskSchedule.hourly(every=interval),
+            initial_delay=180,
+            metadata={
+                "provider_instance": self.instance_id,
+                "provider_domain": self.domain,
+                "operation": "cache_prefetch",
+            },
+            allow_retry=True,
+            allow_cancel=True,
+        )
+        self._prefetch_task_registered = True
+
+    async def unload(self, is_removed: bool = False) -> None:
+        """Unregister the prefetch task and unload the provider."""
+
+        if getattr(self, "_prefetch_task_registered", False):
+            self.mass.tasks.unregister_scheduled_task(
+                self._prefetch_task_id,
+                clear_persisted_state=is_removed,
+            )
+        await super().unload(is_removed)
+
+    def _config_positive_int(self, key: str, default: int) -> int:
+        """Return a positive configured integer or its safe default."""
+
+        try:
+            value = int(self.config.get_value(key))
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
 
     def _create_ytmusic_client(
         self, auth: dict[str, str] | None = None, user: str | None = None
@@ -1422,6 +1551,256 @@ class YoutubeMusicFreeProvider(MusicProvider):
             if not completed:
                 with suppress(OSError):
                     await asyncio.to_thread(os.remove, partial_path)
+
+    def _foreground_playback_active(self) -> bool:
+        """Return whether any Music Assistant player is currently playing."""
+
+        players = getattr(self.mass, "players", None)
+        if players is None:
+            return False
+        try:
+            player_items = iter(players)
+        except TypeError:
+            return False
+        for player in player_items:
+            playback_state = getattr(player, "playback_state", None)
+            state_value = getattr(playback_state, "value", playback_state)
+            if str(state_value).lower() == "playing":
+                return True
+        return False
+
+    async def _prefetch_candidates(self, limit: int) -> list[str]:
+        """Collect uncached library video IDs, optionally including playlists."""
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def add_track(track: Track) -> None:
+            video_id, start, end = _split_track_id(track.item_id)
+            if (
+                not video_id
+                or start is not None
+                or end is not None
+                or video_id in seen
+            ):
+                return
+            seen.add(video_id)
+            if self._find_cached_path(video_id) is None:
+                candidates.append(video_id)
+
+        async for track in self.get_library_tracks():
+            add_track(track)
+            if len(candidates) >= limit:
+                return candidates
+
+        if not self.config.get_value(CONF_PREFETCH_PLAYLISTS):
+            return candidates
+
+        async for playlist in self.get_library_playlists():
+            try:
+                playlist_tracks = await self.get_playlist_tracks(playlist.item_id)
+            except Exception as err:  # noqa: BLE001
+                self.logger.warning(
+                    "Unable to enumerate playlist %s for prefetch: %s",
+                    playlist.item_id,
+                    err,
+                )
+                continue
+            for track in playlist_tracks:
+                add_track(track)
+                if len(candidates) >= limit:
+                    return candidates
+        return candidates
+
+    async def _completed_cache_size(self) -> int:
+        """Return bytes occupied by completed provider cache files."""
+
+        def calculate() -> int:
+            total = 0
+            try:
+                names = os.listdir(self._cache_directory)
+            except OSError:
+                return 0
+            for name in names:
+                if name.endswith(".part"):
+                    continue
+                file_path = os.path.join(self._cache_directory, name)
+                with suppress(OSError):
+                    if os.path.isfile(file_path):
+                        total += os.path.getsize(file_path)
+            return total
+
+        return await asyncio.to_thread(calculate)
+
+    async def _prefetch_track(
+        self,
+        video_id: str,
+        cache_size: int,
+        cache_limit: int | None,
+        pause_during_playback: bool,
+    ) -> tuple[str, int]:
+        """Download one track to the persistent cache without involving a player."""
+
+        if self._find_cached_path(video_id) is not None:
+            return ("skipped", 0)
+        if pause_during_playback and self._foreground_playback_active():
+            return ("paused", 0)
+
+        stream_format = await self._get_stream_format(video_id)
+        audio_ext = stream_format.get("audio_ext") or stream_format.get("ext", "m4a")
+        safe_audio_ext = re.sub(r"[^a-z0-9]", "", str(audio_ext).lower()) or "audio"
+        cache_path = self._cache_path(video_id, safe_audio_ext)
+        partial_path = f"{cache_path}.part"
+        if os.path.isfile(cache_path) or cache_path in self._cache_writers:
+            return ("skipped", 0)
+
+        headers = {
+            str(key): str(value)
+            for key, value in (stream_format.get("http_headers") or {}).items()
+        }
+        cache_file = None
+        completed = False
+        bytes_written = 0
+        self._cache_writers.add(cache_path)
+        try:
+            await asyncio.to_thread(
+                os.makedirs,
+                self._cache_directory,
+                mode=0o775,
+                exist_ok=True,
+            )
+            cache_file = await asyncio.to_thread(open, partial_path, "wb")
+            async with self.mass.http_session.get(
+                str(stream_format["url"]), headers=headers
+            ) as response:
+                response.raise_for_status()
+                if (
+                    cache_limit is not None
+                    and response.content_length is not None
+                    and cache_size + response.content_length > cache_limit
+                ):
+                    return ("limit", 0)
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    if pause_during_playback and self._foreground_playback_active():
+                        return ("paused", 0)
+                    if (
+                        cache_limit is not None
+                        and cache_size + bytes_written + len(chunk) > cache_limit
+                    ):
+                        return ("limit", 0)
+                    await asyncio.to_thread(cache_file.write, chunk)
+                    bytes_written += len(chunk)
+            await asyncio.to_thread(cache_file.flush)
+            await asyncio.to_thread(os.fsync, cache_file.fileno())
+            await asyncio.to_thread(cache_file.close)
+            cache_file = None
+            await asyncio.to_thread(os.replace, partial_path, cache_path)
+            completed = True
+            self.logger.info(
+                "Prefetched YouTube Music track %s to %s",
+                video_id,
+                cache_path,
+            )
+            return ("downloaded", bytes_written)
+        finally:
+            if cache_file is not None:
+                with suppress(OSError):
+                    await asyncio.to_thread(cache_file.close)
+            self._cache_writers.discard(cache_path)
+            if not completed:
+                with suppress(OSError):
+                    await asyncio.to_thread(os.remove, partial_path)
+
+    async def _run_cache_prefetch(self) -> None:
+        """Prefetch uncached authenticated-library tracks as a native MA task."""
+
+        if not self._authenticated or not self._cache_enabled:
+            self.logger.info("Skipping YouTube Music prefetch: provider is not ready")
+            return
+
+        configured_pause = self.config.get_value(CONF_PREFETCH_PAUSE_PLAYBACK)
+        pause_during_playback = (
+            True if configured_pause is None else bool(configured_pause)
+        )
+        if pause_during_playback and self._foreground_playback_active():
+            self.logger.info("Skipping YouTube Music prefetch while a player is active")
+            return
+
+        max_tracks = self._config_positive_int(CONF_PREFETCH_MAX_TRACKS, 100)
+        raw_cache_limit = self.config.get_value(CONF_PREFETCH_MAX_CACHE_GB)
+        try:
+            cache_limit_gb = int(raw_cache_limit)
+        except (TypeError, ValueError):
+            cache_limit_gb = 50
+        cache_limit = (
+            cache_limit_gb * 1024 * 1024 * 1024 if cache_limit_gb > 0 else None
+        )
+        cache_size = await self._completed_cache_size()
+        if cache_limit is not None and cache_size >= cache_limit:
+            self.logger.info(
+                "Skipping YouTube Music prefetch: cache is at its %s GB limit",
+                cache_limit_gb,
+            )
+            return
+
+        candidates = await self._prefetch_candidates(max_tracks)
+        if not candidates:
+            self.mass.tasks.update_current_task_progress(
+                100, "All selected YouTube Music tracks are cached"
+            )
+            self.logger.info("YouTube Music prefetch found no uncached tracks")
+            return
+
+        downloaded = 0
+        skipped = 0
+        failed = 0
+        for index, video_id in enumerate(candidates, start=1):
+            progress = int(((index - 1) / len(candidates)) * 100)
+            self.mass.tasks.update_current_task_progress(
+                progress,
+                f"Caching track {index}/{len(candidates)}",
+            )
+            try:
+                result, added_bytes = await self._prefetch_track(
+                    video_id,
+                    cache_size,
+                    cache_limit,
+                    pause_during_playback,
+                )
+            except Exception as err:  # noqa: BLE001
+                failed += 1
+                self.logger.warning(
+                    "Unable to prefetch YouTube Music track %s: %s",
+                    video_id,
+                    err,
+                )
+                continue
+            if result == "downloaded":
+                downloaded += 1
+                cache_size += added_bytes
+            elif result == "skipped":
+                skipped += 1
+            elif result == "paused":
+                self.logger.info(
+                    "Paused YouTube Music prefetch because foreground playback started"
+                )
+                break
+            elif result == "limit":
+                self.logger.info(
+                    "Stopped YouTube Music prefetch at the configured cache-size limit"
+                )
+                break
+
+        self.mass.tasks.update_current_task_progress(
+            100,
+            f"Downloaded {downloaded}, skipped {skipped}, failed {failed}",
+        )
+        self.logger.info(
+            "YouTube Music prefetch finished: downloaded=%s skipped=%s failed=%s",
+            downloaded,
+            skipped,
+            failed,
+        )
 
     def _cache_path(self, item_id: str, extension: str) -> str:
         """Return an instance-local, path-safe cache filename."""
