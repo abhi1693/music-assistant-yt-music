@@ -1005,6 +1005,7 @@ def test_completed_stream_is_cached_and_reused(provider, tmp_path):
     cached = asyncio.run(provider.get_stream_details("dQw4w9WgXcQ", MediaType.TRACK))
     assert cached.stream_type == StreamType.LOCAL_FILE
     assert cached.path.endswith(".m4a")
+    assert cached.expiration == 0
     assert open(cached.path, "rb").read() == b"first play"
     provider._cache_writers = set()  # simulate fresh provider state after restart
     persisted = asyncio.run(

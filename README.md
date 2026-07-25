@@ -304,6 +304,12 @@ Completed cache files:
 - Are never silently replaced because the quality preference changed
 - Restore seeking on subsequent plays
 
+Music Assistant can continue playing after an active cache file is deleted
+because its decoder may already hold an open file descriptor and a decoded audio
+buffer. Cached local stream details expire immediately, so once that active
+buffer is no longer reusable, Music Assistant asks the provider to check disk
+again and a missing file is downloaded normally.
+
 Partial files:
 
 - Are never considered cache hits
@@ -395,6 +401,17 @@ direct stream and are not cached.
   published the cache file.
 - Confirm the completed and partial filenames have the same hash and extension.
 - Confirm only one Music Assistant deployment writes to that cache directory.
+
+### Confirming that playback uses the persistent cache
+
+- Look for `Serving YouTube Music track ... from persistent cache ...` in Music
+  Assistant logs.
+- A cache hit does not create or grow a `.part` file.
+- The Music Assistant signal-path panel shows the provider and codec, not
+  whether transport came from YouTube or a local file.
+- `Quality unknown` can appear for a local cache hit because the cached
+  `LOCAL_FILE` response does not currently persist the original bitrate as
+  metadata; it is not proof of an upstream request.
 
 ### A `.part` remains after playback
 
