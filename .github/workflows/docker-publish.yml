@@ -5,7 +5,7 @@ on:
     # Runs every Sunday at 04:00 AM UTC to catch new updates
     - cron: '0 4 * * 0'
   push:
-    branches: [ "main" ]
+    branches: [ "master" ]
     paths:
       - 'ytmusic_free/**'
       - 'Dockerfile'
