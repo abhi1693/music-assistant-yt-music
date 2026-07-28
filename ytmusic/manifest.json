@@ -3,7 +3,7 @@
   "domain": "ytmusic",
   "stage": "experimental",
   "name": "YouTube Music",
-  "description": "Stream YouTube Music and retain completed plays in a persistent local cache.",
+  "description": "Stream YouTube Music, surface Last.fm discovery, and retain completed plays in a persistent local cache.",
   "codeowners": ["abhi1693"],
   "documentation": "https://github.com/abhi1693/music-assistant-yt-music/blob/master/README.md",
   "requirements": [

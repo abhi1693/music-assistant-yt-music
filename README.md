@@ -2,8 +2,8 @@
 
 An experimental Music Assistant music provider for YouTube and YouTube Music.
 It supports anonymous catalogue playback, optional account-backed library
-features, and persistent local playback of completed background downloads for
-bandwidth-constrained installations.
+features, Last.fm-powered discovery, and persistent local playback of completed
+background downloads for bandwidth-constrained installations.
 
 This is an unofficial community integration. It is not affiliated with Google,
 YouTube, YouTube Music, or the Music Assistant project.
@@ -14,6 +14,8 @@ YouTube, YouTube Music, or the Music Assistant project.
 - Direct playback without a YouTube Premium subscription
 - Optional saved library, likes, subscriptions, playlists, and recommendations
   through a browser cookie
+- Optional Last.fm recommendation folders resolved back to playable YouTube
+  Music tracks
 - PostgreSQL account mirroring for saved tracks, likes, albums, artists,
   subscriptions, playlists and membership, history, uploads, podcasts,
   channels, episodes, and account metadata
@@ -30,8 +32,9 @@ Podcast support is not implemented.
 | Component | Responsibility |
 | --- | --- |
 | `ytmusicapi` | Catalogue metadata and authenticated account features |
-| `yt-dlp` | Authenticated format resolution and resumable background downloads |
+| `yt-dlp` | Format resolution and resumable background downloads |
 | Music Assistant | Library management, queueing, decoding, normalization, and players |
+| Last.fm API | Optional artist/track/tag/profile discovery seeds |
 | Persistent cache | Serving atomically published background downloads locally |
 
 An uncached foreground play starts immediately from YouTube and never writes a
@@ -244,6 +247,13 @@ automatically before Music Assistant starts.
 | Upgrade lower-quality cached files | Enabled | Replaces an old cache file only after a strictly better accessible format is complete |
 | Cached quality target | 256 kbps | Checks files below this bitrate, including legacy entries with unknown bitrate |
 | Quality recheck interval | 30 days | Prevents repeated YouTube probes when the current file is already the best accessible format |
+| Last.fm API key | Empty | Enables optional Last.fm recommendation lookups |
+| Last.fm username | Empty | Uses a public Last.fm profile's top tracks as similar-track seeds |
+| Last.fm seed tracks | Empty | Semicolon- or newline-separated `Artist - Track` seeds |
+| Last.fm seed artists | Empty | Artist names used to find similar artists and their top tracks |
+| Last.fm tags | Empty | Tags whose top tracks should be resolved as discovery candidates |
+| Last.fm maximum tracks | 25 | Bounds Last.fm tracks resolved per recommendation or prefetch pass |
+| Fetch Last.fm recommendations to cache | Disabled | Adds resolved Last.fm tracks to the native cache prefetch task |
 
 ## Optional account authentication
 
@@ -397,8 +407,10 @@ rename, and read files in the target directory.
 
 ## Native background prefetch
 
-Authenticated installations can download uncached library tracks before they
-are played. Enable **Prefetch library to cache** in the provider settings.
+Installations can download uncached tracks before they are played. Enable
+**Prefetch library to cache** for authenticated YouTube Music library tracks,
+or enable **Fetch Last.fm recommendations to cache** with a Last.fm API key and
+at least one Last.fm source.
 
 The provider registers a recurring task through Music Assistant's native
 Background Tasks controller. It does not require a sidecar, Kubernetes job,
@@ -408,22 +420,22 @@ and retry controls.
 
 Each run:
 
-1. Enumerates authenticated library tracks.
-2. Optionally enumerates tracks from library playlists.
-3. Reconciles all PostgreSQL cache hits with completed files on disk and
+1. Enumerates enabled sources: authenticated library tracks, optional library
+   playlists, and/or resolved Last.fm recommendations.
+2. Reconciles all PostgreSQL cache hits with completed files on disk and
    requeues stale rows.
-4. Schedules cooled-down quality checks for cached files below the configured
+3. Schedules cooled-down quality checks for cached files below the configured
    bitrate target.
-5. Claims each PostgreSQL job individually, leasing no more than the configured
+4. Claims each PostgreSQL job individually, leasing no more than the configured
    parallel-download limit before starting a batch, so newly requested misses
    can still move ahead of untouched bulk-library work.
-6. Downloads or upgrades at most the configured number of tracks, using the
+5. Downloads or upgrades at most the configured number of tracks, using the
    configured parallel-download limit.
-7. Staggers starts inside each concurrent batch by the configured request delay
+6. Staggers starts inside each concurrent batch by the configured request delay
    and uses yt-dlp's resumable, chunked downloader, the provider's audio-quality
    selector, local staging, and atomic cache publication.
-8. Stops at the configured cache-size ceiling without deleting existing files.
-9. Pauses when foreground playback is active when that protection is enabled.
+7. Stops at the configured cache-size ceiling without deleting existing files.
+8. Pauses when foreground playback is active when that protection is enabled.
 
 Parallel downloads default to `1` and are capped at `8`. A value above `1`
 creates separate yt-dlp track downloads; it does not split one audio file into
@@ -440,8 +452,8 @@ bounded exponential backoff and become terminal after ten attempts. Cache rows
 also store bitrate, upgrade intent, and the last quality-check time so an
 unavailable higher format is not probed on every run.
 An uncached track requested for playback is inserted at priority zero; ordinary
-library inventory uses priority 100. Playback still uses its normal remote
-stream immediately and does not wait for the background download.
+library and Last.fm inventory use priority 100. Playback still uses its normal
+remote stream immediately and does not wait for the background download.
 
 The PostgreSQL integration is fail-open: connection or query failures disable
 durable coordination for that run but do not prevent normal remote playback or
@@ -617,6 +629,8 @@ isolation, incomplete-download safety, and persistent-cache compatibility.
 - Users are responsible for complying with applicable laws, licenses, account
   terms, and YouTube's Terms of Service.
 - Browser cookies are credentials and must be protected accordingly.
+- Last.fm API keys should be treated as application credentials and kept out of
+  logs, screenshots, and public configuration.
 - The software is provided without warranty under the repository's license.
 - Google or YouTube can change or block the unofficial interfaces at any time.
 

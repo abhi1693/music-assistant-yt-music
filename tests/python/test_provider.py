@@ -961,6 +961,13 @@ def test_get_config_entries_returns_expected_keys():
         ytm.CONF_CACHE_UPGRADE_ENABLED,
         ytm.CONF_CACHE_UPGRADE_TARGET_BITRATE,
         ytm.CONF_CACHE_UPGRADE_RECHECK_DAYS,
+        ytm.CONF_LASTFM_API_KEY,
+        ytm.CONF_LASTFM_USERNAME,
+        ytm.CONF_LASTFM_SEED_TRACKS,
+        ytm.CONF_LASTFM_SEED_ARTISTS,
+        ytm.CONF_LASTFM_TAGS,
+        ytm.CONF_LASTFM_MAX_TRACKS,
+        ytm.CONF_LASTFM_PREFETCH_ENABLED,
     ]
     cookie_entry = next(e for e in entries if e.key == ytm.CONF_COOKIE)
     assert cookie_entry.depends_on == ytm.CONF_AUTH_TYPE
@@ -969,6 +976,11 @@ def test_get_config_entries_returns_expected_keys():
         e for e in entries if e.key == ytm.CONF_PREFETCH_PAUSE_PLAYBACK
     )
     assert pause_entry.default_value is False
+    lastfm_prefetch = next(
+        e for e in entries if e.key == ytm.CONF_LASTFM_PREFETCH_ENABLED
+    )
+    assert lastfm_prefetch.default_value is False
+    assert lastfm_prefetch.depends_on == ytm.CONF_CACHE_ENABLED
 
 
 
@@ -1160,7 +1172,12 @@ def test_prefetch_enqueues_durable_catalog_candidates(provider, tmp_path):
                 name=item_id,
             )
 
-    provider.config = SimpleNamespace(get_value=lambda _key: False)
+    values = {
+        ytm.CONF_PREFETCH_ENABLED: True,
+        ytm.CONF_PREFETCH_PLAYLISTS: False,
+    }
+    provider.config = SimpleNamespace(get_value=values.get)
+    provider._authenticated = True
     provider._cache_enabled = True
     provider._cache_directory = str(tmp_path)
     provider._cache_catalog = Catalog()
@@ -1712,6 +1729,240 @@ def test_parallel_prefetch_entry_defaults_to_one():
     assert entry.default_value == 1
     assert entry.depends_on == ytm.CONF_PREFETCH_ENABLED
     assert entry.depends_on_value == [True]
+
+
+# ---------------------------------------------------------------------------
+# Last.fm recommendation source
+# ---------------------------------------------------------------------------
+
+
+def test_lastfm_config_item_splitters_and_seed_track_parser(provider):
+    assert provider._split_config_items("a, b; c\nd") == ["a", "b", "c", "d"]
+    assert provider._split_config_items("Artist, The - Song, Part 2", comma=False) == [
+        "Artist, The - Song, Part 2"
+    ]
+    assert provider._parse_lastfm_seed_track("Artist - Track") == ("Artist", "Track")
+    assert provider._parse_lastfm_seed_track("Artist | Track") == ("Artist", "Track")
+    assert provider._parse_lastfm_seed_track("not enough") is None
+
+
+def test_lastfm_seed_track_fetches_similar_candidates(provider):
+    calls = []
+    provider.config = _StubConfig(
+        {
+            ytm.CONF_LASTFM_API_KEY: "lastfm-key",
+            ytm.CONF_LASTFM_SEED_TRACKS: "Cher - Believe",
+            ytm.CONF_LASTFM_MAX_TRACKS: 2,
+        }
+    )
+
+    async def request(method, **params):
+        calls.append((method, params))
+        return {
+            "similartracks": {
+                "track": [
+                    {
+                        "name": "Ray of Light",
+                        "match": "0.95",
+                        "artist": {"name": "Madonna"},
+                    },
+                    {
+                        "name": "Frozen",
+                        "artist": {"name": "Madonna"},
+                    },
+                ]
+            }
+        }
+
+    provider._lastfm_request = request
+
+    candidates = asyncio.run(provider._lastfm_recommendation_candidates())
+
+    assert calls == [
+        (
+            "track.getsimilar",
+            {
+                "artist": "Cher",
+                "track": "Believe",
+                "autocorrect": 1,
+                "limit": 2,
+            },
+        )
+    ]
+    assert candidates[0] == ytm.LastfmTrackCandidate(
+        artist="Madonna",
+        title="Ray of Light",
+        source="Similar to Cher - Believe",
+        score=0.95,
+    )
+    assert [item.title for item in candidates] == ["Ray of Light", "Frozen"]
+
+
+def test_lastfm_profile_uses_top_tracks_as_similar_track_seeds(provider):
+    calls = []
+    provider.config = _StubConfig(
+        {
+            ytm.CONF_LASTFM_API_KEY: "lastfm-key",
+            ytm.CONF_LASTFM_USERNAME: "listener",
+            ytm.CONF_LASTFM_MAX_TRACKS: 1,
+        }
+    )
+
+    async def request(method, **params):
+        calls.append((method, params))
+        if method == "user.gettoptracks":
+            return {
+                "toptracks": {
+                    "track": [{"name": "Seed Song", "artist": {"name": "Seed Artist"}}]
+                }
+            }
+        return {
+            "similartracks": {
+                "track": [{"name": "Recommended", "artist": {"name": "Other"}}]
+            }
+        }
+
+    provider._lastfm_request = request
+
+    candidates = asyncio.run(provider._lastfm_recommendation_candidates())
+
+    assert [method for method, _params in calls] == [
+        "user.gettoptracks",
+        "track.getsimilar",
+    ]
+    assert candidates[0].artist == "Other"
+    assert candidates[0].title == "Recommended"
+
+
+def test_lastfm_resolves_recommendations_to_youtube_music_tracks(provider):
+    provider.config = _StubConfig(
+        {
+            ytm.CONF_LASTFM_API_KEY: "lastfm-key",
+            ytm.CONF_LASTFM_MAX_TRACKS: 5,
+        }
+    )
+    provider._lastfm_recommendation_candidates = lambda _limit=None: asyncio.sleep(
+        0,
+        result=[ytm.LastfmTrackCandidate("Madonna", "Ray of Light")],
+    )
+    mock = MagicMock()
+    mock.search = MagicMock(
+        return_value=[
+            {
+                "resultType": "song",
+                "videoId": "wrong",
+                "title": "Different Song",
+                "artists": [{"id": "UC1", "name": "Madonna"}],
+            },
+            {
+                "resultType": "song",
+                "videoId": "exact",
+                "title": "Ray of Light",
+                "artists": [{"id": "UC2", "name": "Madonna"}],
+            },
+        ]
+    )
+    provider._ytmusic = mock
+
+    tracks = asyncio.run(provider._lastfm_recommendation_tracks())
+
+    assert [track.item_id for track in tracks] == ["exact"]
+    mock.search.assert_called_once_with(
+        query="Madonna Ray of Light",
+        filter="songs",
+        limit=5,
+    )
+
+
+def test_recommendations_include_lastfm_without_youtube_auth(provider):
+    provider._authenticated = False
+    provider.config = _StubConfig({ytm.CONF_LASTFM_API_KEY: "lastfm-key"})
+
+    async def lastfm_tracks(_limit=None):
+        return [
+            ytm.Track(
+                item_id="lastfm-video",
+                provider=provider.instance_id,
+                name="Last.fm Pick",
+            )
+        ]
+
+    provider._lastfm_recommendation_tracks = lastfm_tracks
+
+    folders = asyncio.run(provider.recommendations())
+
+    assert len(folders) == 1
+    assert folders[0].item_id == "lastfm_recommendations"
+    assert folders[0].items[0].item_id == "lastfm-video"
+
+
+def test_loaded_provider_registers_lastfm_prefetch_without_youtube_auth(provider, tmp_path):
+    values = {
+        ytm.CONF_LASTFM_API_KEY: "lastfm-key",
+        ytm.CONF_LASTFM_PREFETCH_ENABLED: True,
+        ytm.CONF_PREFETCH_INTERVAL: 4,
+    }
+
+    class Tasks:
+        registered = None
+
+        def register_scheduled_task(self, **kwargs):
+            self.registered = kwargs
+
+    tasks = Tasks()
+    provider.mass = SimpleNamespace(tasks=tasks)
+    provider.config = SimpleNamespace(get_value=values.get)
+    provider._authenticated = False
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+    provider._prefetch_task_id = f"{provider.instance_id}_prefetch"
+
+    asyncio.run(provider.loaded_in_mass())
+
+    assert tasks.registered["task_id"] == f"{provider.instance_id}_prefetch"
+    assert tasks.registered["handler"] == provider._run_cache_prefetch
+    assert tasks.registered["schedule"].every == 4
+
+
+def test_prefetch_candidates_include_lastfm_tracks_when_enabled(provider, tmp_path):
+    values = {
+        ytm.CONF_PREFETCH_ENABLED: False,
+        ytm.CONF_LASTFM_API_KEY: "lastfm-key",
+        ytm.CONF_LASTFM_PREFETCH_ENABLED: True,
+    }
+
+    class Catalog:
+        enqueued = []
+        reconciled = []
+
+        async def enqueue(self, track_ids, priority=100):
+            self.enqueued = list(track_ids)
+            self.priority = priority
+
+        async def reconcile_cached(self, entries):
+            self.reconciled = list(entries)
+
+    async def lastfm_tracks(_limit=None):
+        return [
+            ytm.Track(
+                item_id="lastfm-video",
+                provider=provider.instance_id,
+                name="Last.fm Pick",
+            )
+        ]
+
+    provider.config = SimpleNamespace(get_value=values.get)
+    provider._authenticated = False
+    provider._cache_enabled = True
+    provider._cache_directory = str(tmp_path)
+    provider._cache_catalog = Catalog()
+    provider._lastfm_recommendation_tracks = lastfm_tracks
+
+    candidates = asyncio.run(provider._prefetch_candidates(10))
+
+    assert candidates == ["lastfm-video"]
+    assert provider._cache_catalog.enqueued == ["lastfm-video"]
+    assert provider._cache_catalog.priority == 100
 
 
 # ---------------------------------------------------------------------------

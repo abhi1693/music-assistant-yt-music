@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib
+import json
 import logging
 import os
 import re
@@ -23,9 +24,11 @@ import shutil
 import time
 from collections.abc import AsyncGenerator
 from contextlib import suppress
+from dataclasses import dataclass
 from http.cookiejar import Cookie
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption, ConfigValueType
 from music_assistant_models.enums import (
@@ -78,8 +81,13 @@ if TYPE_CHECKING:
 
 
 YTM_DOMAIN = "https://music.youtube.com"
+LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
+LASTFM_USER_AGENT = "music-assistant-yt-music/lastfm"
 VARIOUS_ARTISTS_YTM_ID = "UCUTXlgdcKU5vfzFqHOWIvkA"
 DEFAULT_STREAM_URL_EXPIRATION = 3600  # 1 hour
+DEFAULT_LASTFM_RECOMMENDATION_LIMIT = 25
+LASTFM_MAX_SEED_TRACKS = 5
+LASTFM_MAX_SIMILAR_ARTISTS = 5
 
 # Features that work without a YTM account
 BASE_FEATURES = {
@@ -133,6 +141,13 @@ CONF_PREFETCH_REQUEST_DELAY = "prefetch_request_delay_seconds"
 CONF_CACHE_UPGRADE_ENABLED = "cache_upgrade_enabled"
 CONF_CACHE_UPGRADE_TARGET_BITRATE = "cache_upgrade_target_bitrate_kbps"
 CONF_CACHE_UPGRADE_RECHECK_DAYS = "cache_upgrade_recheck_days"
+CONF_LASTFM_API_KEY = "lastfm_api_key"
+CONF_LASTFM_USERNAME = "lastfm_username"
+CONF_LASTFM_SEED_TRACKS = "lastfm_seed_tracks"
+CONF_LASTFM_SEED_ARTISTS = "lastfm_seed_artists"
+CONF_LASTFM_TAGS = "lastfm_tags"
+CONF_LASTFM_MAX_TRACKS = "lastfm_max_tracks"
+CONF_LASTFM_PREFETCH_ENABLED = "lastfm_prefetch_enabled"
 AUTH_TYPE_NONE = "none"
 AUTH_TYPE_COOKIE = "cookie"
 DEFAULT_CACHE_DIRECTORY = "/data/ytmusic-cache"
@@ -143,6 +158,16 @@ MIRROR_HISTORY_PLAYLIST_ID = "__ytmusic_history__"
 
 class _PrefetchPaused(Exception):
     """Stop yt-dlp without discarding its resumable partial file."""
+
+
+@dataclass(frozen=True, slots=True)
+class LastfmTrackCandidate:
+    """One Last.fm recommendation before it is resolved in YouTube Music."""
+
+    artist: str
+    title: str
+    source: str = "Last.fm"
+    score: float | None = None
 
 
 # Releases before multi-instance support wrote the browser auth headers to this
@@ -545,6 +570,73 @@ async def get_config_entries(
             description="Minimum time before a cached file that already has the best "
             "accessible format is checked again.",
         ),
+        ConfigEntry(
+            key=CONF_LASTFM_API_KEY,
+            type=ConfigEntryType.SECURE_STRING,
+            label="Last.fm API key",
+            default_value="",
+            required=False,
+            description="Optional API key used to fetch Last.fm discovery data. "
+            "Configure a Last.fm username, seed tracks, seed artists, or tags "
+            "to turn that data into Music Assistant recommendations.",
+        ),
+        ConfigEntry(
+            key=CONF_LASTFM_USERNAME,
+            type=ConfigEntryType.STRING,
+            label="Last.fm username",
+            default_value="",
+            required=False,
+            description="Optional public Last.fm profile. The provider uses the "
+            "profile's top tracks as seeds for similar-track recommendations.",
+        ),
+        ConfigEntry(
+            key=CONF_LASTFM_SEED_TRACKS,
+            type=ConfigEntryType.STRING,
+            label="Last.fm seed tracks",
+            default_value="",
+            required=False,
+            description="Optional semicolon- or newline-separated seeds in "
+            "'Artist - Track' format. Each seed uses Last.fm similar tracks.",
+        ),
+        ConfigEntry(
+            key=CONF_LASTFM_SEED_ARTISTS,
+            type=ConfigEntryType.STRING,
+            label="Last.fm seed artists",
+            default_value="",
+            required=False,
+            description="Optional comma-, semicolon-, or newline-separated artists. "
+            "The provider fetches similar artists and resolves their top tracks.",
+        ),
+        ConfigEntry(
+            key=CONF_LASTFM_TAGS,
+            type=ConfigEntryType.STRING,
+            label="Last.fm tags",
+            default_value="",
+            required=False,
+            description="Optional comma-, semicolon-, or newline-separated Last.fm "
+            "tags whose top tracks should be considered for discovery.",
+        ),
+        ConfigEntry(
+            key=CONF_LASTFM_MAX_TRACKS,
+            type=ConfigEntryType.INTEGER,
+            label="Last.fm maximum tracks",
+            default_value=DEFAULT_LASTFM_RECOMMENDATION_LIMIT,
+            required=False,
+            description="Maximum Last.fm tracks resolved into one recommendation "
+            "folder or one prefetch candidate pass.",
+        ),
+        ConfigEntry(
+            key=CONF_LASTFM_PREFETCH_ENABLED,
+            type=ConfigEntryType.BOOLEAN,
+            label="Fetch Last.fm recommendations to cache",
+            default_value=False,
+            required=False,
+            depends_on=CONF_CACHE_ENABLED,
+            depends_on_value=[True],
+            description="Include resolved Last.fm recommendations in the native "
+            "background cache task. The normal max-track, parallelism, pacing, "
+            "and cache-size settings still apply.",
+        ),
     )
 
 
@@ -669,16 +761,22 @@ class YoutubeMusicProvider(MusicProvider):
         """Register native account-mirror and prefetch tasks after provider load."""
 
         await super().loaded_in_mass()
-        if not self._authenticated:
+        library_prefetch_enabled = bool(self.config.get_value(CONF_PREFETCH_ENABLED))
+        lastfm_prefetch_enabled = self._lastfm_prefetch_enabled()
+        if (
+            not self._authenticated
+            and not (self._cache_enabled and lastfm_prefetch_enabled)
+        ):
             return
         if TaskSchedule is None or not hasattr(self.mass, "tasks"):
             self.logger.warning(
-                "YouTube Music account sync and prefetch require a Music Assistant "
-                "release with native background tasks"
+                "YouTube Music account sync and background prefetch require a "
+                "Music Assistant release with native background tasks"
             )
             return
         if (
-            self._cache_catalog is not None
+            self._authenticated
+            and self._cache_catalog is not None
             and self.config.get_value(CONF_ACCOUNT_SYNC_ENABLED) is not False
         ):
             account_interval = self._config_positive_int(
@@ -701,12 +799,12 @@ class YoutubeMusicProvider(MusicProvider):
             self._account_sync_task_registered = True
         if (
             self._cache_enabled
-            and self.config.get_value(CONF_PREFETCH_ENABLED)
+            and (library_prefetch_enabled or lastfm_prefetch_enabled)
         ):
             interval = self._config_positive_int(CONF_PREFETCH_INTERVAL, 6)
             self.mass.tasks.register_scheduled_task(
                 task_id=self._prefetch_task_id,
-                name=f"{self.name} library prefetch",
+                name=f"{self.name} cache prefetch",
                 handler=self._run_cache_prefetch,
                 schedule=TaskSchedule.hourly(every=interval),
                 initial_delay=180,
@@ -777,6 +875,436 @@ class YoutubeMusicProvider(MusicProvider):
         except (TypeError, ValueError):
             return default
         return value if value > 0 else default
+
+    def _lastfm_api_key(self) -> str:
+        """Return the configured Last.fm API key, if present."""
+
+        if not self.config:
+            return ""
+        return str(self.config.get_value(CONF_LASTFM_API_KEY) or "").strip()
+
+    def _lastfm_limit(self, limit: int | None = None) -> int:
+        """Return a bounded positive Last.fm recommendation limit."""
+
+        configured = self._config_positive_int(
+            CONF_LASTFM_MAX_TRACKS,
+            DEFAULT_LASTFM_RECOMMENDATION_LIMIT,
+        )
+        if limit is not None and limit > 0:
+            configured = min(configured, limit)
+        return max(1, min(configured, 100))
+
+    def _lastfm_prefetch_enabled(self) -> bool:
+        """Return whether Last.fm should feed the background cache task."""
+
+        if not self._lastfm_api_key():
+            return False
+        if not self.config:
+            return False
+        return bool(self.config.get_value(CONF_LASTFM_PREFETCH_ENABLED))
+
+    @staticmethod
+    def _split_config_items(value: Any, *, comma: bool = True) -> list[str]:
+        """Split a compact provider setting into non-empty values."""
+
+        if not value:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            raw_items = [str(item) for item in value]
+        else:
+            text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+            separators = "\n;"
+            if comma:
+                separators += ","
+            pattern = "[" + re.escape(separators) + "]"
+            raw_items = re.split(pattern, text)
+        return [item.strip() for item in raw_items if item and item.strip()]
+
+    @staticmethod
+    def _parse_lastfm_seed_track(value: str) -> tuple[str, str] | None:
+        """Parse one Last.fm seed in ``Artist - Track`` or ``Artist | Track`` form."""
+
+        for separator in (" - ", " | ", "\t"):
+            artist, found, track = value.partition(separator)
+            if found and artist.strip() and track.strip():
+                return artist.strip(), track.strip()
+        match = re.match(r"^(.+?)\s+[-|]\s+(.+)$", value)
+        if match:
+            artist = match.group(1).strip()
+            track = match.group(2).strip()
+            if artist and track:
+                return artist, track
+        return None
+
+    @staticmethod
+    def _normalize_match_text(value: str) -> str:
+        """Normalize display text for rough cross-catalog matching."""
+
+        return re.sub(r"[^a-z0-9]+", "", str(value).lower())
+
+    def _lastfm_request_sync(self, method: str, **params: Any) -> dict[str, Any]:
+        """Call one Last.fm JSON endpoint using only the Python standard library."""
+
+        query = {
+            key: value
+            for key, value in params.items()
+            if value is not None and value != ""
+        }
+        query.update(
+            {
+                "method": method,
+                "api_key": self._lastfm_api_key(),
+                "format": "json",
+            }
+        )
+        request = Request(
+            f"{LASTFM_API_URL}?{urlencode(query)}",
+            headers={"User-Agent": LASTFM_USER_AGENT},
+        )
+        with urlopen(request, timeout=15) as response:
+            payload = response.read()
+        data = json.loads(payload.decode("utf-8"))
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(
+                f"Last.fm {method} returned error {data.get('error')}: "
+                f"{data.get('message', 'unknown error')}"
+            )
+        return data if isinstance(data, dict) else {}
+
+    async def _lastfm_request(self, method: str, **params: Any) -> dict[str, Any]:
+        """Call Last.fm without blocking the Music Assistant event loop."""
+
+        return await asyncio.to_thread(self._lastfm_request_sync, method, **params)
+
+    @staticmethod
+    def _list_lastfm_items(value: Any) -> list[dict[str, Any]]:
+        """Normalize Last.fm's one-or-many response fields to a list of dicts."""
+
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            return [value]
+        return []
+
+    @staticmethod
+    def _parse_lastfm_track_item(
+        item: dict[str, Any],
+        source: str,
+    ) -> LastfmTrackCandidate | None:
+        """Parse one Last.fm track item into a recommendation candidate."""
+
+        title = str(item.get("name") or item.get("title") or "").strip()
+        artist_obj = item.get("artist")
+        if isinstance(artist_obj, dict):
+            artist = str(
+                artist_obj.get("name")
+                or artist_obj.get("#text")
+                or artist_obj.get("artist")
+                or ""
+            ).strip()
+        else:
+            artist = str(artist_obj or item.get("artistName") or "").strip()
+        if not artist or not title:
+            return None
+        score = None
+        with suppress(TypeError, ValueError):
+            score = float(item.get("match"))
+        return LastfmTrackCandidate(
+            artist=artist,
+            title=title,
+            source=source,
+            score=score,
+        )
+
+    def _lastfm_track_items(
+        self,
+        items: Any,
+        source: str,
+    ) -> list[LastfmTrackCandidate]:
+        """Parse a Last.fm response field containing track-like objects."""
+
+        candidates: list[LastfmTrackCandidate] = []
+        for item in self._list_lastfm_items(items):
+            if candidate := self._parse_lastfm_track_item(item, source):
+                candidates.append(candidate)
+        return candidates
+
+    async def _lastfm_similar_tracks(
+        self,
+        artist: str,
+        track: str,
+        limit: int,
+        source: str,
+    ) -> list[LastfmTrackCandidate]:
+        """Fetch Last.fm similar tracks for one artist/track seed."""
+
+        response = await self._lastfm_request(
+            "track.getsimilar",
+            artist=artist,
+            track=track,
+            autocorrect=1,
+            limit=limit,
+        )
+        similar = response.get("similartracks", {}).get("track", [])
+        return self._lastfm_track_items(similar, source)
+
+    async def _lastfm_top_tracks_for_artist(
+        self,
+        artist: str,
+        limit: int,
+        source: str,
+    ) -> list[LastfmTrackCandidate]:
+        """Fetch top tracks for one Last.fm artist."""
+
+        response = await self._lastfm_request(
+            "artist.gettoptracks",
+            artist=artist,
+            autocorrect=1,
+            limit=limit,
+        )
+        top_tracks = response.get("toptracks", {}).get("track", [])
+        return self._lastfm_track_items(top_tracks, source)
+
+    async def _lastfm_recommendation_candidates(
+        self,
+        limit: int | None = None,
+    ) -> list[LastfmTrackCandidate]:
+        """Collect Last.fm recommendation candidates from configured sources."""
+
+        if not self._lastfm_api_key():
+            return []
+        target = self._lastfm_limit(limit)
+        candidates: list[LastfmTrackCandidate] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add(items: list[LastfmTrackCandidate]) -> None:
+            for item in items:
+                identity = (
+                    self._normalize_match_text(item.artist),
+                    self._normalize_match_text(item.title),
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                candidates.append(item)
+                if len(candidates) >= target:
+                    break
+
+        async def guarded(label: str, call: Any) -> list[LastfmTrackCandidate]:
+            try:
+                return await call
+            except Exception as err:  # noqa: BLE001
+                self.logger.warning(
+                    "Last.fm recommendation source %s failed: %s",
+                    label,
+                    type(err).__name__,
+                )
+                return []
+
+        username = str(self.config.get_value(CONF_LASTFM_USERNAME) or "").strip()
+        if username:
+            try:
+                response = await self._lastfm_request(
+                    "user.gettoptracks",
+                    user=username,
+                    period="overall",
+                    limit=LASTFM_MAX_SEED_TRACKS,
+                )
+                seed_tracks = self._lastfm_track_items(
+                    response.get("toptracks", {}).get("track", []),
+                    f"Last.fm profile {username}",
+                )
+            except Exception as err:  # noqa: BLE001
+                self.logger.warning(
+                    "Last.fm profile seed %s failed: %s",
+                    username,
+                    type(err).__name__,
+                )
+                seed_tracks = []
+            for seed in seed_tracks[:LASTFM_MAX_SEED_TRACKS]:
+                add(
+                    await guarded(
+                        f"profile:{username}",
+                        self._lastfm_similar_tracks(
+                            seed.artist,
+                            seed.title,
+                            target,
+                            f"Similar to {seed.artist} - {seed.title}",
+                        ),
+                    )
+                )
+                if len(candidates) >= target:
+                    return candidates
+
+        for raw_seed in self._split_config_items(
+            self.config.get_value(CONF_LASTFM_SEED_TRACKS),
+            comma=False,
+        ):
+            if parsed := self._parse_lastfm_seed_track(raw_seed):
+                artist, track = parsed
+                add(
+                    await guarded(
+                        f"track:{raw_seed}",
+                        self._lastfm_similar_tracks(
+                            artist,
+                            track,
+                            target,
+                            f"Similar to {artist} - {track}",
+                        ),
+                    )
+                )
+            if len(candidates) >= target:
+                return candidates
+
+        for artist in self._split_config_items(
+            self.config.get_value(CONF_LASTFM_SEED_ARTISTS)
+        ):
+            try:
+                response = await self._lastfm_request(
+                    "artist.getsimilar",
+                    artist=artist,
+                    autocorrect=1,
+                    limit=LASTFM_MAX_SIMILAR_ARTISTS,
+                )
+                similar_artists = [
+                    str(item.get("name") or "").strip()
+                    for item in self._list_lastfm_items(
+                        response.get("similarartists", {}).get("artist", [])
+                    )
+                    if str(item.get("name") or "").strip()
+                ]
+            except Exception as err:  # noqa: BLE001
+                self.logger.warning(
+                    "Last.fm artist seed %s failed: %s",
+                    artist,
+                    type(err).__name__,
+                )
+                similar_artists = []
+            for similar_artist in similar_artists[:LASTFM_MAX_SIMILAR_ARTISTS]:
+                add(
+                    await guarded(
+                        f"artist:{similar_artist}",
+                        self._lastfm_top_tracks_for_artist(
+                            similar_artist,
+                            max(1, min(5, target - len(candidates))),
+                            f"Top tracks by similar artist {similar_artist}",
+                        ),
+                    )
+                )
+                if len(candidates) >= target:
+                    return candidates
+
+        for tag in self._split_config_items(self.config.get_value(CONF_LASTFM_TAGS)):
+            add(
+                await guarded(
+                    f"tag:{tag}",
+                    self._lastfm_tag_top_tracks(
+                        tag,
+                        target - len(candidates),
+                    ),
+                )
+            )
+            if len(candidates) >= target:
+                return candidates
+
+        return candidates
+
+    async def _lastfm_tag_top_tracks(
+        self,
+        tag: str,
+        limit: int,
+    ) -> list[LastfmTrackCandidate]:
+        """Fetch top Last.fm tracks for one tag."""
+
+        response = await self._lastfm_request(
+            "tag.gettoptracks",
+            tag=tag,
+            limit=limit,
+        )
+        tracks = response.get("tracks", {}).get("track", [])
+        return self._lastfm_track_items(tracks, f"Last.fm tag {tag}")
+
+    def _lastfm_track_matches_result(
+        self,
+        candidate: LastfmTrackCandidate,
+        track: Track,
+    ) -> int:
+        """Score how closely a YouTube Music search result matches Last.fm."""
+
+        candidate_title = self._normalize_match_text(candidate.title)
+        candidate_artist = self._normalize_match_text(candidate.artist)
+        track_title = self._normalize_match_text(track.name)
+        artist_names = [
+            self._normalize_match_text(getattr(artist, "name", ""))
+            for artist in getattr(track, "artists", [])
+        ]
+        score = 0
+        if track_title == candidate_title:
+            score += 2
+        elif candidate_title and candidate_title in track_title:
+            score += 1
+        if candidate_artist and candidate_artist in artist_names:
+            score += 2
+        elif candidate_artist and any(
+            candidate_artist in artist_name or artist_name in candidate_artist
+            for artist_name in artist_names
+            if artist_name
+        ):
+            score += 1
+        return score
+
+    async def _resolve_lastfm_candidate(
+        self,
+        candidate: LastfmTrackCandidate,
+    ) -> Track | None:
+        """Resolve one Last.fm artist/title pair to the best YouTube Music track."""
+
+        query = f"{candidate.artist} {candidate.title}".strip()
+        if not query:
+            return None
+        try:
+            results = await asyncio.to_thread(
+                self._ytmusic.search,
+                query=query,
+                filter="songs",
+                limit=5,
+            )
+        except Exception as err:  # noqa: BLE001
+            self.logger.debug("Last.fm search resolution failed for %r: %s", query, err)
+            return None
+        parsed: list[Track] = []
+        for result in results or []:
+            if not isinstance(result, dict):
+                continue
+            if result.get("resultType") not in ("song", "video", None):
+                continue
+            with suppress(InvalidDataError, KeyError, TypeError):
+                parsed.append(self._parse_track(result))
+        if not parsed:
+            return None
+        return max(
+            parsed,
+            key=lambda track: self._lastfm_track_matches_result(candidate, track),
+        )
+
+    async def _lastfm_recommendation_tracks(
+        self,
+        limit: int | None = None,
+    ) -> list[Track]:
+        """Return Last.fm recommendations resolved as playable provider tracks."""
+
+        candidates = await self._lastfm_recommendation_candidates(limit)
+        tracks: list[Track] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            track = await self._resolve_lastfm_candidate(candidate)
+            if track is None or track.item_id in seen:
+                continue
+            seen.add(track.item_id)
+            tracks.append(track)
+            if len(tracks) >= self._lastfm_limit(limit):
+                break
+        return tracks
 
     @staticmethod
     def _mirror_object_id(payload: dict[str, Any], object_type: str) -> str | None:
@@ -2014,7 +2542,7 @@ class YoutubeMusicProvider(MusicProvider):
         return False
 
     async def _prefetch_candidates(self, limit: int) -> list[str]:
-        """Collect uncached library video IDs, optionally including playlists."""
+        """Collect uncached video IDs from enabled background sources."""
 
         candidates: list[str] = []
         cached_entries: list[tuple[str, str, int, str]] = []
@@ -2043,12 +2571,24 @@ class YoutubeMusicProvider(MusicProvider):
                         )
                     )
 
-        async for track in self.get_library_tracks():
-            add_track(track)
-            if len(candidates) >= limit:
-                break
+        include_library = True
+        if self.config:
+            configured_library = self.config.get_value(CONF_PREFETCH_ENABLED)
+            include_library = True if configured_library is None else bool(configured_library)
+        include_library = include_library and self._authenticated
 
-        if len(candidates) < limit and self.config.get_value(CONF_PREFETCH_PLAYLISTS):
+        if include_library:
+            async for track in self.get_library_tracks():
+                add_track(track)
+                if len(candidates) >= limit:
+                    break
+
+        if (
+            include_library
+            and len(candidates) < limit
+            and self.config
+            and self.config.get_value(CONF_PREFETCH_PLAYLISTS)
+        ):
             async for playlist in self.get_library_playlists():
                 try:
                     playlist_tracks = await self.get_playlist_tracks(playlist.item_id)
@@ -2063,6 +2603,14 @@ class YoutubeMusicProvider(MusicProvider):
                     add_track(track)
                     if len(candidates) >= limit:
                         break
+                if len(candidates) >= limit:
+                    break
+
+        if self._lastfm_prefetch_enabled() and len(candidates) < limit:
+            for track in await self._lastfm_recommendation_tracks(
+                limit - len(candidates)
+            ):
+                add_track(track)
                 if len(candidates) >= limit:
                     break
 
@@ -2323,10 +2871,17 @@ class YoutubeMusicProvider(MusicProvider):
                     await asyncio.to_thread(os.remove, f"{cache_path}.part")
 
     async def _run_cache_prefetch(self) -> None:
-        """Prefetch uncached authenticated-library tracks as a native MA task."""
+        """Prefetch uncached tracks from enabled background sources as a native MA task."""
 
-        if not self._authenticated or not self._cache_enabled:
+        if not self._cache_enabled:
             self.logger.info("Skipping YouTube Music prefetch: provider is not ready")
+            return
+        configured_library = self.config.get_value(CONF_PREFETCH_ENABLED)
+        include_library = True if configured_library is None else bool(configured_library)
+        include_library = include_library and self._authenticated
+        include_lastfm = self._lastfm_prefetch_enabled()
+        if not include_library and not include_lastfm:
+            self.logger.info("Skipping YouTube Music prefetch: no source is enabled")
             return
 
         configured_pause = self.config.get_value(CONF_PREFETCH_PAUSE_PLAYBACK)
@@ -2923,49 +3478,61 @@ class YoutubeMusicProvider(MusicProvider):
             return False
 
     async def recommendations(self) -> list[RecommendationFolder]:
-        """Get personalized recommendations from YouTube Music home feed."""
-        if not self._authenticated:
-            return []
-        try:
-            home = await asyncio.to_thread(self._ytmusic.get_home, limit=6)
-        except Exception as err:
-            self._warn_library_error("get_home", err)
-            return []
+        """Get recommendation folders from Last.fm and YouTube Music."""
         folders: list[RecommendationFolder] = []
-        for section in home:
-            title = section.get("title", "Recommendations")
-            items: list[MediaItemType | ItemMapping] = []
-            for content in section.get("contents", []):
-                if not content:
-                    continue
-                with suppress(InvalidDataError, KeyError, TypeError):
-                    if video_id := content.get("videoId"):
-                        track = self._parse_track(content)
-                        if track:
-                            items.append(track)
-                    elif browse_id := content.get("browseId"):
-                        if content.get("subscribers") or content.get("type") == "artist":
-                            items.append(self._get_item_mapping(
-                                MediaType.ARTIST, browse_id, content.get("title", "")
-                            ))
-                        elif content.get("type") in ("album", "single", "ep"):
-                            items.append(self._get_item_mapping(
-                                MediaType.ALBUM, browse_id, content.get("title", "")
-                            ))
-                        elif content.get("playlistId") or "playlist" in content.get("type", ""):
-                            items.append(self._get_item_mapping(
-                                MediaType.PLAYLIST,
-                                content.get("playlistId", browse_id),
-                                content.get("title", ""),
-                            ))
-            if items:
-                folder = RecommendationFolder(
-                    item_id=f"ytm_rec_{title.lower().replace(' ', '_')}",
-                    provider=self.instance_id,
-                    name=title,
-                    items=UniqueList(items),
+
+        if self._lastfm_api_key():
+            lastfm_tracks = await self._lastfm_recommendation_tracks()
+            if lastfm_tracks:
+                folders.append(
+                    RecommendationFolder(
+                        item_id="lastfm_recommendations",
+                        provider=self.instance_id,
+                        name="Last.fm recommendations",
+                        items=UniqueList(lastfm_tracks),
+                    )
                 )
-                folders.append(folder)
+
+        if self._authenticated:
+            try:
+                home = await asyncio.to_thread(self._ytmusic.get_home, limit=6)
+            except Exception as err:
+                self._warn_library_error("get_home", err)
+                home = []
+            for section in home:
+                title = section.get("title", "Recommendations")
+                items: list[MediaItemType | ItemMapping] = []
+                for content in section.get("contents", []):
+                    if not content:
+                        continue
+                    with suppress(InvalidDataError, KeyError, TypeError):
+                        if video_id := content.get("videoId"):
+                            track = self._parse_track(content)
+                            if track:
+                                items.append(track)
+                        elif browse_id := content.get("browseId"):
+                            if content.get("subscribers") or content.get("type") == "artist":
+                                items.append(self._get_item_mapping(
+                                    MediaType.ARTIST, browse_id, content.get("title", "")
+                                ))
+                            elif content.get("type") in ("album", "single", "ep"):
+                                items.append(self._get_item_mapping(
+                                    MediaType.ALBUM, browse_id, content.get("title", "")
+                                ))
+                            elif content.get("playlistId") or "playlist" in content.get("type", ""):
+                                items.append(self._get_item_mapping(
+                                    MediaType.PLAYLIST,
+                                    content.get("playlistId", browse_id),
+                                    content.get("title", ""),
+                                ))
+                if items:
+                    folder = RecommendationFolder(
+                        item_id=f"ytm_rec_{title.lower().replace(' ', '_')}",
+                        provider=self.instance_id,
+                        name=title,
+                        items=UniqueList(items),
+                    )
+                    folders.append(folder)
         return folders
 
     # ------------------------------------------------------------------
