@@ -1002,6 +1002,16 @@ def test_get_config_entries_returns_expected_keys():
     assert lastfm_prefetch.depends_on == ytm.CONF_CACHE_ENABLED
 
 
+def test_provider_instance_exposes_config_entries_for_rehydration(provider):
+    """Music Assistant 2.10 asks the loaded provider for its option schema."""
+
+    entries = asyncio.run(provider.get_config_entries())
+
+    assert next(entry for entry in entries if entry.key == ytm.CONF_AUTH_TYPE)
+    assert next(entry for entry in entries if entry.key == ytm.CONF_COOKIE)
+    assert next(entry for entry in entries if entry.key == ytm.CONF_CACHE_CATALOG_DSN)
+
+
 
 def test_cache_miss_uses_http_and_never_writes_foreground_cache(provider, tmp_path):
     """Safe mode keeps cache writes completely outside foreground playback."""

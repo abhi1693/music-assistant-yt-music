@@ -667,6 +667,17 @@ class YoutubeMusicProvider(MusicProvider):
     # a second, genuinely empty account raise a false partial-auth error.
     _library_seen_nonempty: dict[str, bool]
 
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return the provider options for Music Assistant 2.10 rehydration.
+
+        Music Assistant now resolves option entries from the provider instance
+        before ``handle_async_init``. Without this hook it only knows the common
+        server entries and drops typed YouTube Music values such as auth_type
+        and cookie_header from the runtime ProviderConfig.
+        """
+
+        return await get_config_entries(self.mass, self.instance_id)
+
     async def handle_async_init(self) -> None:
         """Set up the YTMusic provider."""
         logging.getLogger("yt_dlp").setLevel(logging.WARNING)

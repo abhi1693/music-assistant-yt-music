@@ -51,6 +51,9 @@ headers distinct from ytmusicapi's duplicate origin headers, and reuses the
 Google account selector for extraction and media requests; no plaintext cookie
 file is created, and the downloader does not repeat an anonymous watch-page
 extraction.
+The provider also exposes its option schema through Music Assistant 2.10's
+instance-level configuration hook so stored cookie, account, cache, and
+prefetch settings are typed before asynchronous provider initialization.
 Requests are paced, and a YouTube bot-verification response creates a durable
 PostgreSQL cooldown before further queue claims.
 
