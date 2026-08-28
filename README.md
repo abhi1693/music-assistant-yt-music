@@ -46,9 +46,11 @@ accepted as cache hits.
 
 Each background claim performs one authenticated extraction and passes that
 already-resolved format directly to yt-dlp. The provider loads its configured
-browser session into yt-dlp's in-memory cookie jar and reuses the Google account
-selector for extraction and media requests; no plaintext cookie file is
-created, and the downloader does not repeat an anonymous watch-page extraction.
+browser session into yt-dlp's in-memory cookie jar, keeps yt-dlp's watch-page
+headers distinct from ytmusicapi's duplicate origin headers, and reuses the
+Google account selector for extraction and media requests; no plaintext cookie
+file is created, and the downloader does not repeat an anonymous watch-page
+extraction.
 Requests are paced, and a YouTube bot-verification response creates a durable
 PostgreSQL cooldown before further queue claims.
 

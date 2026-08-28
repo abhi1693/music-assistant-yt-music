@@ -215,6 +215,25 @@ def test_build_auth_headers_honors_the_account_index(provider, monkeypatch):
     assert headers["x-goog-authuser"] == "2"
 
 
+def test_ytdlp_headers_drop_duplicate_x_origin(provider):
+    """yt-dlp must not receive ytmusicapi's duplicate origin headers."""
+
+    provider._auth_headers = {
+        "authorization": "SAPISIDHASH secret",
+        "cookie": "SAPISID=secret",
+        "origin": ytm.YTM_DOMAIN,
+        "x-origin": ytm.YTM_DOMAIN,
+        "x-goog-authuser": "2",
+        "user-agent": "browser",
+    }
+
+    assert provider._ytdlp_http_headers() == {
+        "Origin": ytm.YTM_DOMAIN,
+        "X-Goog-Authuser": "2",
+        "User-Agent": "browser",
+    }
+
+
 def test_two_instances_can_target_different_accounts_of_one_cookie(monkeypatch):
     _forbid_open(monkeypatch)
     shared_cookie = "__Secure-3PAPISID=shared; SAPISID=shared2"

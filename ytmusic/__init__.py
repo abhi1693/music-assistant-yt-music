@@ -3617,7 +3617,12 @@ class YoutubeMusicProvider(MusicProvider):
         headers = {
             str(key).title(): str(value)
             for key, value in getattr(self, "_auth_headers", {}).items()
-            if key.lower() not in {"content-type", "authorization", "cookie"}
+            # ytmusicapi requires both Origin and X-Origin, but passing both to
+            # yt-dlp 2026.8.19 corrupts YouTube's embedded ytcfg response and
+            # raises KeyError("INNERTUBE_CONTEXT"). Origin is sufficient for
+            # yt-dlp's authenticated watch-page and media requests.
+            if key.lower()
+            not in {"content-type", "authorization", "cookie", "x-origin"}
         }
         return headers
 
